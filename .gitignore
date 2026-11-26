@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local environments
+.venv/
+venv/
+
+# Experiment outputs (untracked by design; champions live in solutions/)
+runs/
+
+# Solver licences / credentials
+*.lic
+gurobi.env
+.env
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
