@@ -17,7 +17,7 @@ from evaluator import evaluate
 
 
 class Model:
-    def __init__(self, inst, k_pairs=40):
+    def __init__(self, inst, k_pairs=10**6):
         self.inst = inst
         P, T, M = len(inst["ports"]), len(inst["sites"]), len(inst["carriers"])
         F, R, S = len(inst["flows"]), len(inst["routes"]), len(inst["scenarios"])
@@ -228,10 +228,20 @@ def search(md, opts, time_limit, seed, log=False, reheat=1.0):
         c = st.costs()
         return float(c.max() + eps * c.mean()), st.violation(), int(c.max())
 
+    def fits(f, o):
+        refn = st.ref[md.nominal]
+        return all(refn[md.rm[r], md.tdep[f]] > 0 and refn[md.rm[r], md.tarr[f]] > 0
+                   for r in o if r >= 0 and md.rm[r] != md.spot_m)
+
     def random_single(f):
         old = st.opt[f]
         if rng.random() < 0.7 or old[1] < 0:
-            r1, r2 = rng.choice(md.options[f])
+            opts_f = md.options[f]
+            if rng.random() < 0.5:
+                fit = [o for o in rng.sample(opts_f, min(30, len(opts_f))) if fits(f, o)]
+                if fit:
+                    opts_f = fit
+            r1, r2 = rng.choice(opts_f)
             k = md.n[f] if r2 < 0 else rng.choice(_split_choices(md, f, r1, r2, rng))
         else:
             r1, r2 = old[0], old[1]
@@ -281,6 +291,51 @@ def search(md, opts, time_limit, seed, log=False, reheat=1.0):
             load = int(st.cl[:, m][st.cl[:, m] > 0].min()) if (st.cl[:, m] > 0).any() else 0
         return olds
 
+    flows_at = {}
+    for f in range(md.F):
+        flows_at.setdefault(md.tdep[f], []).append(f)
+        flows_at.setdefault(md.tarr[f], []).append(f)
+    has_m = [{md.rm[r] for o in md.options[f] for r in o if r >= 0} for f in range(md.F)]
+
+    def site_swap(m):
+        """Compound move on carrier m's site set: drop one site (if at limit), add another, then
+        greedily move flows whose both endpoints are served by m onto an option using m."""
+        refm = st.ref[md.nominal, m]
+        Z = set(np.nonzero(refm > 0)[0].tolist())
+        cand_t = [t for t in range(md.T) if t not in Z and any(m in has_m[f] for f in flows_at.get(t, []))]
+        if not cand_t:
+            return None
+        t_add = rng.choice(cand_t)
+        olds = []
+        if len(Z) >= md.maxsites[m] and Z:
+            zs = sorted(Z, key=lambda t: refm[t])
+            t_drop = zs[0] if rng.random() < 0.5 else rng.choice(zs)
+            ev = evacuate(m, t_drop)
+            if ev is None:
+                return None
+            olds += ev
+            Z.discard(t_drop)
+        Z.add(t_add)
+        Jc, Vc, _ = obj()
+        cur = Jc + lam * Vc
+        for f in rng.sample(flows_at[t_add], len(flows_at[t_add])):
+            if st.uses(f, m) or m not in has_m[f] or md.tdep[f] not in Z or md.tarr[f] not in Z:
+                continue
+            os_ = [o for o in md.options[f] if md.rm[o[0]] == m or (o[1] >= 0 and md.rm[o[1]] == m)]
+            old = st.opt[f]
+            bestc = (cur, old)
+            for r1, r2 in rng.sample(os_, min(6, len(os_))):
+                o = (r1, r2, md.n[f] if r2 < 0 else md.n[f] - 1)
+                st.set(f, o)
+                Jc, Vc, _ = obj()
+                if Jc + lam * Vc < bestc[0]:
+                    bestc = (Jc + lam * Vc, o)
+            st.set(f, bestc[1])
+            if bestc[1] != old:
+                olds.append((f, old))
+                cur = bestc[0]
+        return olds
+
     def worst_flows():
         sw = int(np.argmax(st.costs()))
         return [f for f in range(md.F) if md.fail[st.opt[f][0], sw] or (st.opt[f][1] >= 0 and md.fail[st.opt[f][1], sw])]
@@ -311,7 +366,13 @@ def search(md, opts, time_limit, seed, log=False, reheat=1.0):
         temp = T0 * (T1 / T0) ** frac
         it += 1
         u = rng.random()
-        if u < 0.001:
+        if u < 0.003:
+            m = rng.choice([m for m in range(md.M) if m != md.spot_m])
+            olds = site_swap(m)
+            if not olds:
+                continue
+            undo = lambda olds=olds: [st.set(f, o) for f, o in reversed(olds)]  # noqa: E731
+        elif u < 0.004:
             closed = [m for m in range(md.M) if m != md.spot_m and st.cl[md.nominal, m] == 0]
             if not closed:
                 continue
@@ -319,7 +380,7 @@ def search(md, opts, time_limit, seed, log=False, reheat=1.0):
             if olds is None:
                 continue
             undo = lambda olds=olds: [st.set(f, o) for f, o in reversed(olds)]  # noqa: E731
-        elif u < 0.005:
+        elif u < 0.008:
             open_c = [m for m in range(md.M) if m != md.spot_m and st.cl[md.nominal, m] > 0]
             if not open_c:
                 continue

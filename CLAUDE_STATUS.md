@@ -1,7 +1,7 @@
 # CLAUDE_STATUS — Claude's handoff log (Claude-owned; Codex/humans read-only)
 
 ## File ownership (anti-merge-conflict contract)
-- Claude edits ONLY: `evaluator.py`, `baseline.py`, `heuristic.py`, `benchmark.py`, `tests/test_evaluator.py`, `CLAUDE_STATUS.md`, `solutions/claude/`.
+- Claude edits ONLY: `evaluator.py`, `baseline.py`, `heuristic.py`, `benchmark.py`, `lns.py`, `tests/test_evaluator.py`, `CLAUDE_STATUS.md`, `solutions/claude/`, `.gitignore` (added at user's request).
 - Claude never edits: `common.py`, `milp_solver.py`, `reuse.py`, `tests/test_milp.py`, `tests/test_reuse.py` (Codex); `main.py`, `requirements.txt`, `README.md`, `.gitignore`, `best/`, ZIP (humans); `instances/` (read-only).
 - Branch `feat/claude-heuristics` (from `main` @ dfe04b7). Staging by explicit path only. No push/merge without the user's go.
 - Untracked and left for the humans: `instances/`, PDFs, `prompt.md`, `claude+codex.md`, `codex_output..md`, `last_output_from_codex.md`, `.venv/`, `runs/`.
@@ -52,6 +52,16 @@ objective max_s C_s + 0.02 mean_s C_s + lambda*violation (adaptive lambda, grade
 - Codex `origin/feat/optimization` @ca27544 run from a read-only worktree (`../kiro_codex_view`), highspy 1.16.0. Codex's model-checked scores == evaluator.py scores exactly on all runs (independent cross-validation).
 - Champions committed in `solutions/claude/` with pipeline/command in `.meta.json`. Final ZIP must contain both Claude and Codex sources used.
 - `.gitignore` added on this branch at the user's request (Codex: don't add a second one → add/add conflict).
+
+## Checkpoint 4 — leaderboard gap (14:00) — team "double span" not yet submitted
+Leaderboard https://kiro.enpc.org/classement/ (39 ranked): #1 v2v 817.51M (272.98 / 280.24 / 264.29); best per instance 272.19 / 280.19 / 263.57.
+Ours: 304.55 / 293.52 / 295.74 = 893.81M (~#28). Gap ~30M on alliances & strikes, ~13M on reliability.
+Diagnosis: carrier `sites(m)` limits are saturated for almost all carriers; some carriers never opened (alliances: E; strikes: G,B,D);
+9.5k–14k TEU stay on SPOT (~2.4x cost). Per-scenario LB (cheapest surviving route, no fixed/reuse): 224.2 / 228.5 / 216.2M.
+=> The key decision is the carrier->site sets. **Codex suggestion:** binaries e_{m,t} (11x48) with sum_t e_{m,t} <= sites(m),
+u_r <= e_{m,t_dep}, u_r <= e_{m,t_arr}; candidate routes per flow restricted by those sets — likely what top teams solve.
+Experiments running: SA v3 site-swap compound move; `lns.py` = neighbourhood selection (SPOT-heavy sites / worst scenario /
+carrier / big SPOT flows) delegated to `milp_solver._neighborhood` (Codex private fn; would switch to public `free_flows` kwarg).
 
 ## Notes for Codex's MILP (insights, no file edits)
 1. Rerouted x^s exact & big-M-free: for affected flow f in s, continuous x^s_r with x^s_r = 0 (r failed), x^s_r >= x_r, x^s_r <= n_f u_r, sum_r x^s_r = n_f. Given integral (x,u) it is exact AND enforces survival. Unaffected flows: x^s = x.
