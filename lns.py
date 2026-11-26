@@ -8,6 +8,7 @@ import argparse
 import datetime
 import json
 import math
+import shutil
 import random
 import sys
 import time
@@ -109,6 +110,82 @@ def neighbourhoods(inst, sol, res, rng, size, weights=None):
     return kind, set(free[:size])
 
 
+def attribution(inst, sol, res):
+    """Per-scenario cost attribution: for each scenario, cost delta vs nominal per flow (rerouting + lost reuse)."""
+    routes, flows = inst["routes"], inst["flows"]
+    cost = unit_costs(inst)
+    tc = {(t["id"], e["port"]): e["cost"] for t in inst["sites"] for e in t["ports"]}
+    xs = {e["route"]: e["n"] for e in sol["x"]}
+    used = {}
+    for r in xs:
+        used.setdefault(routes[r]["flow"], []).append(r)
+    nominal = {f: sum(xs[r] * cost[r] for r in rs) for f, rs in used.items()}
+    out = {}
+    for sc in inst["scenarios"]:
+        failed = set(sc["routes"])
+        if not failed:
+            continue
+        d = Counter()
+        for f, rs in used.items():
+            alive = [r for r in rs if r not in failed]
+            if len(alive) < len(rs) and alive:
+                d[f] += flows[f]["n"] * cost[alive[0]] - nominal[f]
+        for e in sol.get("y", []):
+            if e["from"] in failed or e["to"] in failed:
+                i, j = e["from"], e["to"]
+                sv = (tc[(flows[routes[i]["flow"]]["t_arr"], routes[i]["p_arr"])]
+                      + tc[(flows[routes[j]["flow"]]["t_dep"], routes[j]["p_dep"])]) * e["n"]
+                d[routes[i]["flow"]] += sv / 2
+                d[routes[j]["flow"]] += sv / 2
+        out[sc["id"]] = d
+    return out
+
+
+def big_or_tail(inst, sol, res, rng, mode, size, frac):
+    """Structural neighbourhoods: 'big' = 20-40% of flows by blocks; 'tail' = drivers of the worst scenarios."""
+    routes, flows = inst["routes"], inst["flows"]
+    F = len(flows)
+    sc = res["scenario_costs"]
+    ranked = sorted(sc, key=sc.get, reverse=True)
+    if mode == "tail":
+        att = attribution(inst, sol, res)
+        k = rng.choice([1, 1, 2, 3])
+        tot = Counter()
+        for s in ranked[:k]:
+            if s in att:
+                tot.update(att[s])
+        top = [f for f, v in tot.most_common() if v > 0][: 2 * size]
+        rng.shuffle(top)
+        free = set(top[:size])
+        while len(free) < size:  # pad with random flows sharing carriers/sites with the drivers
+            free.add(rng.randrange(F))
+        return f"tail{k}", free
+    n_free = int(F * frac)
+    block = rng.choice(["random", "carrier", "site", "tail"])
+    used = {}
+    for e in sol["x"]:
+        used.setdefault(routes[e["route"]]["flow"], []).append(e["route"])
+    if block == "carrier":
+        ms_ = rng.sample(sorted({routes[r]["carrier"] for rs in used.values() for r in rs}), 3)
+        pool = [f for f, rs in used.items() if any(routes[r]["carrier"] in ms_ for r in rs)]
+    elif block == "site":
+        ts = set(rng.sample(range(len(inst["sites"])), 8))
+        pool = [f["id"] for f in flows if f["t_dep"] in ts or f["t_arr"] in ts]
+    elif block == "tail":
+        att = attribution(inst, sol, res)
+        tot = Counter()
+        for s in ranked[:3]:
+            tot.update(att.get(s, {}))
+        pool = [f for f, _ in tot.most_common(n_free)]
+    else:
+        pool = list(range(F))
+    rng.shuffle(pool)
+    free = set(pool[:n_free])
+    while len(free) < n_free:
+        free.add(rng.randrange(F))
+    return f"big-{block}", free
+
+
 def kick(inst, problem, ms, sol, rng):
     """ILS perturbation: short low-temperature SA on the allocation, then global split+reuse polish."""
     import heuristic
@@ -134,6 +211,10 @@ def main():
     ap.add_argument("--size", type=int, default=25, help="max free flows per neighbourhood")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--kick", type=int, default=0, help="ILS: after this many consecutive failures, perturb (0=off)")
+    ap.add_argument("--mode", default="alns", choices=["alns", "big", "tail", "mix"],
+                    help="alns: adaptive small neighbourhoods; big: exact repair of 20-40%% of flows; "
+                         "tail: drivers of the worst scenarios; mix: alternate big/tail/alns")
+    ap.add_argument("--destroy", default="0.2-0.4", help="big mode: fraction range of flows freed")
     ap.add_argument("--init", default="solutions/claude", help="folder with the starting <name>.json")
     ap.add_argument("--out", default="solutions/claude", help="folder where improved <name>.json is written")
     a = ap.parse_args()
@@ -166,16 +247,22 @@ def main():
                 stats["kicks"] += 1
             else:
                 fails = 0
-        kinds = ["site", "worst", "carrier", "spot", "regret", "topk", "port"]
-        wts = [(stats[k + "_won"] + 1) / (stats[k + "_tried"] + 2) for k in kinds]  # adaptive (ALNS)
-        size = min(70, int(a.size * 1.25 ** (fails // 5)))  # grow neighbourhoods while stagnating
-        kind, free = neighbourhoods(inst, sol, res, rng, rng.randint(max(5, size - 10), size + 15), wts)
+        mode = a.mode if a.mode != "mix" else rng.choice(["big", "tail", "alns"])
+        t0 = time.monotonic()
+        if mode == "alns":
+            kinds = ["site", "worst", "carrier", "spot", "regret", "topk", "port"]
+            wts = [(stats[k + "_won"] + 1) / (stats[k + "_tried"] + 2) for k in kinds]  # adaptive (ALNS)
+            size = min(70, int(a.size * 1.25 ** (fails // 5)))  # grow neighbourhoods while stagnating
+            kind, free = neighbourhoods(inst, sol, res, rng, rng.randint(max(5, size - 10), size + 15), wts)
+            pc, rl = rng.choice([(2, 6), (2, 8), (3, 10), (3, 12), (None, None)])
+            if rl is None:  # full candidate catalogue: keep the neighbourhood small
+                free = set(rng.sample(sorted(free), min(len(free), 14)))
+        else:
+            lo, hi = map(float, a.destroy.split("-"))
+            kind, free = big_or_tail(inst, sol, res, rng, mode, rng.randint(a.size, 2 * a.size), rng.uniform(lo, hi))
+            pc, rl = rng.choice([(2, 6), (1, 5)]) if mode == "big" else rng.choice([(2, 6), (3, 10)])
         if not free:
             continue
-        t0 = time.monotonic()
-        pc, rl = rng.choice([(2, 6), (2, 8), (3, 10), (3, 12), (None, None)])
-        if rl is None:  # full candidate catalogue: keep the neighbourhood small
-            free = set(rng.sample(sorted(free), min(len(free), 14)))
         try:
             trial = ms._candidate(problem, sol, min(t_end, time.monotonic() + a.sub), rng.randrange(10**6),
                                   free=free, per_carrier=pc, route_limit=rl, reuse=True)
@@ -193,10 +280,13 @@ def main():
                   f"{res['score']} -> {r2['score']} ({time.monotonic() - t0:.0f}s)", flush=True)
             cur = evaluate(inst, json.load(open(path))) if os.path.exists(path) else {"score": None}
             if cur["score"] is None or r2["score"] < cur["score"]:  # another process may have improved it
+                if os.path.exists(path):  # timestamped backup of the file being replaced
+                    os.makedirs(os.path.join(a.out, "history"), exist_ok=True)
+                    shutil.copy(path, os.path.join(a.out, "history", f"{datetime.datetime.now():%H%M%S}_{name}.json"))
                 json.dump(cand, open(path, "w"))
                 meta = {"when": datetime.datetime.now().isoformat(timespec="seconds"), "instance": name,
                         "score": r2["score"], "worst": worst_scenario(r2), "valid": True,
-                        "pipeline": "lns.py neighbourhoods -> codex milp_solver._neighborhood (@ca27544)",
+                        "pipeline": f"lns.py --mode {a.mode} ({kind}) -> codex milp_solver._candidate (@ca27544)",
                         "command": " ".join(sys.argv), "scenario_costs": r2["scenario_costs"]}
                 json.dump(meta, open(os.path.join(a.out, f"{name}.meta.json"), "w"), indent=1)
             sol, res = cand, r2
