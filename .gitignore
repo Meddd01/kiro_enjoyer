@@ -1,0 +1,10 @@
+# Local solver installations and Python caches
+/.venv/
+/.kiro-deps/
+/gurobi.lic
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Generated candidates, benchmark logs, and local experiments
+/runs/

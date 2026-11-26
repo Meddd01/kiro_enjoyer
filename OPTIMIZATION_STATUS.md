@@ -17,3 +17,16 @@ python milp_solver.py instances/alliances.json neighborhood.json --initial impro
 ```
 
 Run the same commands with the relevant instance path. Time-limited incumbents can vary across machines. Any candidate intended for submission should be checked through the independent team evaluator. The local runs keep each incumbent and the exact argument list separately from the source branch.
+
+## Candidate checkpoint
+
+Generated with source commit `ca27544`. The original JSON instances and three best candidates were checked by a separate exact-arithmetic scenario checker and agreed with the model. The designated team evaluator still needs to review these files.
+
+| Instance | Worst cost (USD) | Worst scenario | Nominal SPOT TEU | Reused TEU | Local file |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Alliances | 296,030,437 | 1 | 13,058 | 20,915 | `runs/optimization/alliances_best.json` |
+| Reliability | 301,641,522 | 24 | 9,942 | 18,958 | `runs/optimization/reliability_best.json` |
+| Strikes | 281,492,969 | 27 | 13,265 | 20,372 | `runs/optimization/strikes_best.json` |
+| **Combined** | **879,164,928** | | | | |
+
+The local `candidate_manifest.json` records complete command chains from the raw inputs, solver seed and budgets, and SHA-256 hashes of the three checked outputs. A separate full-catalog per-scenario LP relaxation certified a combined global lower bound of USD 706,843,273. It relaxes integrality, support and utilization constraints, and the link between scenario allocations. The restricted solver logs report bounds only for the specific fixed routes and flow sets loaded in those runs.
