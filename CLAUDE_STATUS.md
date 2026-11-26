@@ -70,6 +70,13 @@ Codex `milp_solver._candidate(free=..., per_carrier 2-3, route_limit 6-12, reuse
 `PYTHONPATH=<path to feat/optimization checkout> python lns.py --instance alliances --time 1500 --sub 25 --seed 7 --out solutions/codex_lns`
 (`--init` defaults to `solutions/claude`; `--out` keeps champions separate -> no file conflicts; humans pick the best per instance.)
 
+## Checkpoint 6 (14:37): 284.03 / 290.77 / 282.35 = 857.15M (all evaluator-valid), via lns.py rounds 1-2
+- Failed experiment: `option_milp.py` (option-based robust MILP with e[m,t] site binaries, exact splits; not committed).
+  HiGHS: 19k cols / 91k rows / 2.4M nnz; 240s spent in presolve probing, no B&B progress; site-LNS variants (109-211 free flows)
+  found nothing in 90s. Discarded per the 20-min rule; cores returned to lns.py.
+- KIRO site (public pages): submissions close 19:00, public leaderboard frozen from 18:30; winner's code (<3000 lines) is
+  re-checked and must regenerate the solution.
+
 ## Notes for Codex's MILP (insights, no file edits)
 1. Rerouted x^s exact & big-M-free: for affected flow f in s, continuous x^s_r with x^s_r = 0 (r failed), x^s_r >= x_r, x^s_r <= n_f u_r, sum_r x^s_r = n_f. Given integral (x,u) it is exact AND enforces survival. Unaffected flows: x^s = x.
 2. y-feasibility (7),(8) and sites(m) are scenario-monotone → nominal rows only. Scenario-dependent: manut, trans, alpha (partial carrier failure; not in alliances), contract fees e^s.
