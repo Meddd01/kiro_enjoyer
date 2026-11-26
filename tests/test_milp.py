@@ -72,6 +72,29 @@ class AllocationTests(unittest.TestCase):
         self.assertEqual(improved["x"], pack({0: 4, 1: 1}, {})["x"])
         self.assertEqual(score, 40)
 
+    def test_neighborhood_changes_only_the_given_flow(self):
+        instance = tiny(scenarios=((),))
+        instance["flows"].append({"id": 1, "t_dep": 0, "t_arr": 0, "n": 5, "routes": [2, 3]})
+        instance["routes"].extend(
+            dict(route, id=route["id"] + 2, flow=1) for route in instance["routes"][:2]
+        )
+        p = Problem(instance)
+        initial = pack({1: 5, 3: 5}, {})
+        result = _neighborhood(instance, p, initial, {1}, monotonic() + 4, 0)
+        self.assertEqual(result["x"], pack({1: 5, 2: 5}, {})["x"])
+        self.assertLess(_score(p, result), _score(p, initial))
+        self.assertEqual(initial, pack({1: 5, 3: 5}, {}))
+        with self.assertRaises(ValueError):
+            _neighborhood(instance, p, initial, {99}, monotonic() + 4, 0)
+
+    def test_each_route_can_fail_without_a_third_backup(self):
+        instance = tiny(scenarios=((), (0,), (1,)))
+        instance["carriers"][1]["name"] = "OTHER"
+        p = Problem(instance)
+        result = solve(instance, time_limit=4)
+        self.assertEqual([row["route"] for row in result["x"]], [0, 1])
+        self.assertEqual(_score(p, result), 92)
+
 
 if __name__ == "__main__":
     unittest.main()

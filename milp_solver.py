@@ -19,6 +19,7 @@ class Model:
     def __init__(self):
         self.lower, self.upper, self.integer = [], [], []
         self.rows, self.cost_rows = [], []
+        self.scenario_rows = {}
         self.worst = self.var()
         self.infeasible = False
 
@@ -43,16 +44,19 @@ class Model:
 
     def cost(self, terms):
         self.row([*terms, (self.worst, -1)], hi=0)
-        self.cost_rows.append(len(self.rows) - 1)
+        index = len(self.rows) - 1
+        self.cost_rows.append(index)
+        return index
+
+    def scenario_cost(self, point, index):
+        row, _, hi = self.rows[index]
+        return sum(a * point[c] for c, a in row.items() if c != self.worst) - hi
 
     def check(self, point):
         """Check the extracted integer point and recalculate the epigraph in USD."""
         if self.infeasible:
             return None
-        point[self.worst] = max(0, *(
-            sum(a * point[c] for c, a in row.items() if c != self.worst) - hi
-            for row, _, hi in (self.rows[i] for i in self.cost_rows)
-        ))
+        point[self.worst] = max(0, *(self.scenario_cost(point, i) for i in self.cost_rows))
         if any(not lo <= n <= hi for n, lo, hi in zip(point, self.lower, self.upper)):
             return None
         for row, lo, hi in self.rows:
@@ -96,14 +100,19 @@ class Model:
             integrality[c] = highspy.HighsVarType.kInteger
         lp.integrality_ = integrality
         if solver.passModel(lp) == highspy.HighsStatus.kError:
-            raise RuntimeError("HiGHS could not load the allocation model")
+            log.warning("HiGHS could not load the allocation model")
+            return None
         if start:
-            solver.setSolution(len(start), list(start), list(start.values()))
+            point = [start.get(c, 0) for c in range(lp.num_col_)]
+            if self.check(point) is not None:
+                solver.setSolution(lp.num_col_, list(range(lp.num_col_)), point)
         remaining = deadline - monotonic()
         if remaining <= 0:
             return None
         solver.setOptionValue("time_limit", remaining)
-        solver.run()
+        if solver.run() == highspy.HighsStatus.kError:
+            log.warning("HiGHS failed while solving the allocation model")
+            return None
         info = solver.getInfo()
         log.info("Model %s rows, %s columns, %s nonzeros | %s | %.2fs | objective %.2f | model bound %.2f",
                  lp.num_row_, lp.num_col_, pointers[-1], solver.getModelStatus().name,
@@ -151,14 +160,18 @@ def _candidates(problem, flow, warm, per_carrier, route_limit, safe_only):
         ))
         allowed = spot | set(ranked[:route_limit]) | set(warm)
 
-    viable = {r for r in allowed if not problem.mask[r] and problem.capacity[r] >= demand}
+    singletons = {r for r in allowed if not problem.mask[r] and problem.capacity[r] >= demand}
+    partners = defaultdict(list)
     if demand >= 2:
         for i, j in combinations(sorted(allowed), 2):
             a, b = problem.mask[i], problem.mask[j]
             ci, cj = problem.capacity[i], problem.capacity[j]
             if not a & b and ci + cj >= demand and (not b or ci >= demand) and (not a or cj >= demand):
-                viable.update((i, j))
-    return sorted(viable | set(warm))
+                partners[i].append(j)
+                partners[j].append(i)
+    return sorted(singletons | partners.keys() | warm.keys()), {
+        r: mates for r, mates in partners.items() if r not in singletons
+    }
 
 
 def _allocation(model, problem, incumbent, free, support_only, per_carrier, route_limit, safe_only):
@@ -173,9 +186,10 @@ def _allocation(model, problem, incumbent, free, support_only, per_carrier, rout
         frozen = f not in free
         if not demand and not warm:
             continue
-        routes = sorted(warm) if frozen or support_only else _candidates(
-            problem, flow, warm, per_carrier, route_limit, safe_only
-        )
+        if frozen or support_only:
+            routes, partners = sorted(warm), {}
+        else:
+            routes, partners = _candidates(problem, flow, warm, per_carrier, route_limit, safe_only)
         x = {}
         for r in routes:
             hi = min(demand, problem.capacity[r])
@@ -198,6 +212,8 @@ def _allocation(model, problem, incumbent, free, support_only, per_carrier, rout
                 continue
         else:
             model.row([(selected[r], 1) for r in routes], hi=2)
+            for r, mates in partners.items():
+                model.row([(selected[r], 1), *((selected[j], -1) for j in mates)], hi=0)
 
         cases = {tuple(routes): x}
         for s, failed in enumerate(problem.failed):
@@ -217,10 +233,12 @@ def _allocation(model, problem, incumbent, free, support_only, per_carrier, rout
                     if len(surviving) == 1:
                         rerouted[surviving[0]] = (None, demand)
                     else:
+                        warm_alive = set(warm).intersection(surviving)
                         for r in surviving:
                             hi = min(demand, problem.capacity[r])
                             c = model.var(hi=hi)
                             rerouted[r] = (c, 1)
+                            starts[c] = demand if warm_alive == {r} else warm.get(r, 0)
                             model.row([(c, 1), (x[r][0], -1)], lo=0)
                             model.row([(c, 1), (selected[r], -hi)], hi=0)
                         model.row(rerouted.values(), lo=demand, hi=demand)
@@ -285,14 +303,16 @@ def _build(problem, x, free, support_only, per_carrier, reuse, route_limit=None,
                 model.row([(e, 1), (z, -1)], lo=0)
             model.row([(e, -1), *((z, 1) for z in columns)], lo=0)
             activations[columns] = e
+            starts[e] = max(starts[z] for z in columns)
         return activations[columns], 1
 
-    seen = set()
+    seen = {}
     for s in [problem.nominal, *(i for i in range(len(realized)) if i != problem.nominal)]:
         affected = problem.failed[s].intersection(nominal)
+        scenario_id = problem.scenarios[s]["id"]
         if affected in seen:
+            model.scenario_rows[scenario_id] = seen[affected]
             continue
-        seen.add(affected)
         quantities = realized[s]
         ports, carriers, contacts, costs = defaultdict(list), defaultdict(list), defaultdict(list), []
         for r, term in quantities.items():
@@ -329,11 +349,11 @@ def _build(problem, x, free, support_only, per_carrier, reuse, route_limit=None,
         costs.extend(
             (c, -saving) for c, saving, mask in arcs.values() if not mask & (1 << s)
         )
-        model.cost(costs)
+        model.scenario_rows[scenario_id] = seen[affected] = model.cost(costs)
     return model, nominal, arcs, starts
 
 
-def _score(problem, solution):
+def _scenario_costs(problem, solution):
     try:
         x, y = unpack(solution)
     except (KeyError, TypeError, ValueError):
@@ -348,11 +368,20 @@ def _score(problem, solution):
     point = [0] * len(model.lower)
     for pair, n in y.items():
         point[arcs[pair][0]] = n
-    return model.check(point)
+    if model.check(point) is None:
+        return None
+    return {s: model.scenario_cost(point, i) for s, i in model.scenario_rows.items()}
+
+
+def _score(problem, solution):
+    costs = _scenario_costs(problem, solution)
+    return max(costs.values()) if costs is not None else None
 
 
 def _candidate(problem, initial, deadline, seed, *, free, support_only=False,
                per_carrier=None, reuse=False, route_limit=None, safe_only=False):
+    if deadline <= monotonic():
+        return None
     x, y = unpack(initial) if initial is not None else ({}, {})
     model, nominal, arcs, start = _build(
         problem, x, free, support_only, per_carrier, reuse, route_limit, safe_only
@@ -393,11 +422,45 @@ def _best(instance, problem, incumbent, trial):
 
 
 def _neighborhood(instance, problem, initial_solution, free, deadline, seed):
-    if _independent_score(instance, problem, initial_solution) is None:
+    if initial_solution is None or _independent_score(instance, problem, initial_solution) is None:
         raise ValueError("Neighborhood optimization requires a feasible incumbent")
+    if not free <= {f["id"] for f in problem.flows}:
+        raise ValueError("Neighborhood includes unknown flow IDs")
     trial = _candidate(problem, initial_solution, deadline, seed, free=free,
-                       per_carrier=2, reuse=True)
+                       per_carrier=2, route_limit=6, reuse=True)
     return pack(*unpack(_best(instance, problem, initial_solution, trial)))
+
+
+def _construct(problem, incumbent, deadline, seed, safe_only):
+    """Seed the robust model by freeing blocks of high-cost flows first."""
+    ranked = sorted(problem.flows, key=lambda f: (
+        -f["n"] * max((problem.cost[r] for r in f["routes"]), default=0), f["id"]
+    ))
+    best_score = _score(problem, incumbent)
+    for offset in range(0, len(ranked), 16):
+        if deadline - monotonic() < 0.15:
+            break
+        free = {f["id"] for f in ranked[offset:offset + 16]}
+        trial = _candidate(problem, incumbent, min(deadline, monotonic() + 5), seed,
+                           free=free, per_carrier=1, route_limit=5, safe_only=safe_only)
+        if trial is not None and trial[1] < best_score:
+            incumbent, best_score = trial
+    return incumbent, best_score
+
+
+def _polish(instance, problem, best, allocation, free, deadline, seed):
+    allocation, score = allocation
+    if score != _independent_score(instance, problem, allocation):
+        log.warning("Discarded no-reuse allocation after validation")
+        return best
+    best = _best(instance, problem, best, (allocation, score))
+    fixed = _candidate(problem, allocation, min(deadline, monotonic() + 5), seed,
+                       free=set(), reuse=True)
+    best = _best(instance, problem, best, fixed)
+    start = fixed[0] if fixed is not None else allocation
+    trial = _candidate(problem, start, deadline, seed, free=free,
+                       support_only=True, reuse=True)
+    return _best(instance, problem, best, trial)
 
 
 def solve(instance, initial_solution=None, time_limit=120.0, seed=0):
@@ -410,14 +473,64 @@ def solve(instance, initial_solution=None, time_limit=120.0, seed=0):
         best = problem.spot_solution()
         if best is not None and _independent_score(instance, problem, best) is None:
             best = None
-    per_carrier = 1 if len(problem.routes) > 500 else None
-    trial = _candidate(problem, best, start + 0.75 * time_limit, seed,
-                       free=free, per_carrier=per_carrier)
-    if trial is not None:
-        improved = _candidate(problem, trial[0], start + time_limit, seed,
-                              free=free, support_only=True, reuse=True)
-        best = _best(instance, problem, best, trial)
-        best = _best(instance, problem, best, improved)
+    deadline = start + time_limit
+    if best is not None and len(problem.routes) > 500:
+        # The official reliability instance has a large always-surviving catalog.
+        # On that catalog the scenario rows collapse to one set.
+        safe_regular = sum(
+            not problem.mask[r["id"]] and r["carrier"] != problem.spot
+            for r in problem.routes
+        )
+        safe_only = safe_regular * 3 > len(problem.routes)
+        warm = pack(unpack(best)[0], {})
+        construction = _construct(problem, warm, start + 0.4 * time_limit, seed, safe_only)
+        best = _polish(instance, problem, best, construction, free,
+                       min(deadline, monotonic() + 10), seed)
+        if safe_only and deadline - monotonic() > 5:
+            trial = _candidate(problem, construction[0], deadline - 4, seed,
+                               free=free, per_carrier=1, route_limit=3, safe_only=True)
+            if trial is not None:
+                best = _polish(instance, problem, best, trial, free, deadline, seed)
+    else:
+        trial = _candidate(problem, best, start + 0.75 * time_limit, seed, free=free)
+        if trial is not None:
+            best = _polish(instance, problem, best, trial, free, deadline, seed)
     if best is None:
         raise RuntimeError("No feasible allocation was found within the time limit")
     return pack(*unpack(best))
+
+
+if __name__ == "__main__":
+    import argparse
+    import json
+    from pathlib import Path
+
+    from common import load_instance
+
+    cli = argparse.ArgumentParser(description=__doc__)
+    cli.add_argument("instance")
+    cli.add_argument("output", type=Path)
+    cli.add_argument("--initial")
+    cli.add_argument("--free-flows", type=int, nargs="*")
+    cli.add_argument("--time", type=float, default=120)
+    cli.add_argument("--seed", type=int, default=0)
+    args = cli.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    instance = load_instance(args.instance)
+    initial = load_instance(args.initial) if args.initial else None
+    problem = Problem(instance)
+    if args.free_flows is None:
+        solution = solve(instance, initial, args.time, args.seed)
+    else:
+        if initial is None:
+            cli.error("--free-flows requires --initial")
+        solution = _neighborhood(
+            instance, problem, initial, set(args.free_flows), monotonic() + args.time, args.seed
+        )
+    costs = _scenario_costs(problem, solution)
+    if costs is None:
+        raise RuntimeError("The solution failed the exact model checks")
+    worst = [s for s, value in costs.items() if value == max(costs.values())]
+    print(f"Model-checked score {max(costs.values())}; worst scenarios {worst}")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(solution, indent=2) + "\n", encoding="utf-8")
