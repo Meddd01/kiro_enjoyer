@@ -196,22 +196,28 @@ def finalize(md, x, rng=None):
         return plain, res0
     sc = res0["scenario_costs"]
     top = max(sc.values())
-    crit = np.array([s for s, c in sc.items() if c >= top - 0.01 * abs(top)], dtype=int)
-
-    def weight(i, j):
-        alive = ~(md.fail[i, crit] | md.fail[j, crit])
-        return 1 + 10 * alive.sum()
-
     best_sol, best_res = plain, res0
-    for w in (weight, None):
+    for thr, mult in ((None, 0), (0.01, 10), (0.003, 10), (0.03, 10), (0.01, 100), (0.05, 3)):
+        w = None
+        if thr is not None:
+            crit = np.array([s for s, c in sc.items() if c >= top - thr * abs(top)], dtype=int)
+            w = (lambda i, j, crit=crit, mult=mult: 1 + mult * int((~(md.fail[i, crit] | md.fail[j, crit])).sum()))
         sol = baseline.to_solution(x, baseline.greedy_reuse(inst, x, w))
         res = evaluate(inst, sol)
         if res["valid"] and res["score"] < best_res["score"]:
             best_sol, best_res = sol, res
+    try:  # optional: Codex's exact reuse optimiser (feat/optimization), used only if importable
+        import reuse as codex_reuse
+        sol = codex_reuse.optimize_reuse(inst, best_sol, time_limit=20.0, seed=0)
+        res = evaluate(inst, sol)
+        if res["valid"] and res["score"] < best_res["score"]:
+            best_sol, best_res = sol, res
+    except Exception as exc:  # ImportError or solver failure: keep greedy reuse
+        print(f"codex reuse unavailable/failed: {exc!r}", file=sys.stderr)
     return best_sol, best_res
 
 
-def search(md, opts, time_limit, seed, log=False):
+def search(md, opts, time_limit, seed, log=False, reheat=1.0):
     rng = random.Random(seed)
     st = State(md)
     for f, o in enumerate(opts):
@@ -253,8 +259,35 @@ def search(md, opts, time_limit, seed, log=False):
             st.set(f, bestc[1])
         return olds
 
+    def bundle_open(m):
+        """Compound move: open carrier m by moving the most promising flows onto options using it."""
+        cand = []
+        for f in range(md.F):
+            if st.uses(f, m):
+                continue
+            os_ = [o for o in md.options[f] if md.rm[o[0]] == m or (o[1] >= 0 and md.rm[o[1]] == m)]
+            if os_:
+                cand.append((min(md.D[o[0]] for o in os_) - md.D[st.opt[f][0]] + rng.random() * 500, f, os_))
+        if not cand:
+            return None
+        cand.sort()
+        olds, load = [], 0
+        for _, f, os_ in cand:
+            if load >= 1.2 * md.minv[m] or len(olds) >= 25:
+                break
+            r1, r2 = min(rng.sample(os_, min(4, len(os_))), key=lambda o: md.D[o[0]] + md.D[o[1]] if o[1] >= 0 else 2 * md.D[o[0]])
+            olds.append((f, st.opt[f]))
+            st.set(f, (r1, r2, md.n[f] if r2 < 0 else md.n[f] - 1))
+            load = int(st.cl[:, m][st.cl[:, m] > 0].min()) if (st.cl[:, m] > 0).any() else 0
+        return olds
+
+    def worst_flows():
+        sw = int(np.argmax(st.costs()))
+        return [f for f in range(md.F) if md.fail[st.opt[f][0], sw] or (st.opt[f][1] >= 0 and md.fail[st.opt[f][1], sw])]
+
     J, V, true = obj()
     best = (true if V == 0 else math.inf, list(st.opt))
+    wf = worst_flows()
     # temperature calibration from sampled uphill deltas (target ~50% acceptance at start)
     ups = []
     for _ in range(300):
@@ -266,8 +299,8 @@ def search(md, opts, time_limit, seed, log=False):
         if d > 0:
             ups.append(d)
         st.set(f, old)
-    T0 = float(np.median(ups)) / math.log(2) if ups else 1e5
-    T1 = T0 * 1e-4
+    T0 = reheat * (float(np.median(ups)) / math.log(2) if ups else 1e5)
+    T1 = T0 * 1e-4 / reheat
     t0 = time.monotonic()
     it = last_feas = last_best = 0
     while True:
@@ -277,7 +310,16 @@ def search(md, opts, time_limit, seed, log=False):
         frac = el / time_limit
         temp = T0 * (T1 / T0) ** frac
         it += 1
-        if rng.random() < 0.004:
+        u = rng.random()
+        if u < 0.001:
+            closed = [m for m in range(md.M) if m != md.spot_m and st.cl[md.nominal, m] == 0]
+            if not closed:
+                continue
+            olds = bundle_open(rng.choice(closed))
+            if olds is None:
+                continue
+            undo = lambda olds=olds: [st.set(f, o) for f, o in reversed(olds)]  # noqa: E731
+        elif u < 0.005:
             open_c = [m for m in range(md.M) if m != md.spot_m and st.cl[md.nominal, m] > 0]
             if not open_c:
                 continue
@@ -290,9 +332,9 @@ def search(md, opts, time_limit, seed, log=False):
             olds = evacuate(m, t)
             if olds is None:
                 continue
-            undo = lambda: [st.set(f, o) for f, o in olds]  # noqa: E731
+            undo = lambda olds=olds: [st.set(f, o) for f, o in olds]  # noqa: E731
         else:
-            f = rng.randrange(md.F)
+            f = rng.choice(wf) if wf and rng.random() < 0.5 else rng.randrange(md.F)
             old, new = st.opt[f], random_single(f)
             if new == old:
                 continue
@@ -310,6 +352,7 @@ def search(md, opts, time_limit, seed, log=False):
         else:
             undo()
         if it % 1000 == 0:
+            wf = worst_flows()
             if frac > 0.9:
                 lam = LMAX
             else:
@@ -326,7 +369,7 @@ def search(md, opts, time_limit, seed, log=False):
     return best
 
 
-def solve(instance, initial_solution=None, time_limit=120.0, seed=0):
+def solve(instance, initial_solution=None, time_limit=120.0, seed=0, reheat=None):
     t_start = time.monotonic()
     md = Model(instance)
     fallback = initial_solution if initial_solution is not None else baseline.solve(instance)
@@ -336,7 +379,10 @@ def solve(instance, initial_solution=None, time_limit=120.0, seed=0):
         fres = evaluate(instance, fallback)
     opts = _opt_from_solution(md, fallback)
     budget = max(1.0, time_limit - (time.monotonic() - t_start) - 5.0)
-    true, best_opts = search(md, opts, budget, seed, log=True)
+    spot_share = sum(e["n"] for e in fallback["x"] if md.rm[e["route"]] == md.spot_m) / sum(md.n)
+    if reheat is None:
+        reheat = 1.0 if spot_share > 0.9 else 0.03  # warm start from a good solution: do not destroy it
+    true, best_opts = search(md, opts, budget, seed, log=True, reheat=reheat)
     if best_opts is None or true == math.inf:
         return fallback
     st = State(md)

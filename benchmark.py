@@ -44,6 +44,7 @@ def main():
     ap.add_argument("--instances", default="all")
     ap.add_argument("--time", type=float, default=120.0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--reheat", type=float, default=None, help="SA start-temperature factor (1 = full)")
     ap.add_argument("--init", default=None, help="folder with <name>.json warm starts (e.g. solutions/claude)")
     a = ap.parse_args()
     names = NAMES if a.instances == "all" else a.instances.split(",")
@@ -60,7 +61,7 @@ def main():
             sol = baseline.solve(inst)
         else:
             import heuristic
-            sol = heuristic.solve(inst, initial_solution=init, time_limit=a.time, seed=a.seed)
+            sol = heuristic.solve(inst, initial_solution=init, time_limit=a.time, seed=a.seed, reheat=a.reheat)
         wall = time.monotonic() - t0
         res = evaluate(inst, sol)
         out = os.path.join(RUNS, f"{a.solver}_{name}_s{a.seed}_t{int(a.time)}.json")
