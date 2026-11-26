@@ -28,13 +28,14 @@ def unit_costs(inst):
     return _UC[key]
 
 
-def neighbourhoods(inst, sol, res, rng, size):
+def neighbourhoods(inst, sol, res, rng, size, weights=None):
     routes, flows, carriers = inst["routes"], inst["flows"], inst["carriers"]
     spot = next(c["id"] for c in carriers if c["name"] == "SPOT")
     used = {}
     for e in sol["x"]:
         used.setdefault(routes[e["route"]]["flow"], []).append(e["route"])
-    kind = rng.choices(["site", "worst", "carrier", "spot", "regret"], weights=[0.2, 0.2, 0.2, 0.2, 0.2])[0]
+    kinds = ["site", "worst", "carrier", "spot", "regret", "topk"]
+    kind = rng.choices(kinds, weights=weights or [1.0] * len(kinds))[0]
     if kind == "site":  # sites weighted by SPOT volume touching them
         w = Counter()
         for e in sol["x"]:
@@ -51,6 +52,18 @@ def neighbourhoods(inst, sol, res, rng, size):
     elif kind == "carrier":
         m = rng.choice([c["id"] for c in carriers if c["id"] != spot])
         free = [f["id"] for f in flows if any(routes[r]["carrier"] == m for r in f["routes"])]
+    elif kind == "topk":  # flows hit by several of the (near-)tied top scenarios: lowers them together
+        sc = res["scenario_costs"]
+        top = sorted(sc, key=sc.get, reverse=True)[: rng.randint(2, 5)]
+        hits = Counter()
+        for s in top:
+            failed = set(inst["scenarios"][s]["routes"])
+            for f, rs in used.items():
+                if any(r in failed for r in rs):
+                    hits[f] += 1
+        free = [f for f, _ in hits.most_common(3 * size)]
+        rng.shuffle(free)
+        free = sorted(free, key=lambda f: -hits[f])[: 2 * size]
     elif kind == "regret":  # flows paying most above their cheapest candidate route (nominal inefficiency)
         cost = unit_costs(inst)
         xs = {e["route"]: e["n"] for e in sol["x"]}
@@ -91,8 +104,12 @@ def main():
     rng = random.Random(a.seed)
     t_end = time.monotonic() + a.time
     stats = Counter()
+    fails = 0
     while time.monotonic() + 3 < t_end:
-        kind, free = neighbourhoods(inst, sol, res, rng, rng.randint(max(5, a.size - 10), a.size + 15))
+        kinds = ["site", "worst", "carrier", "spot", "regret", "topk"]
+        wts = [(stats[k + "_won"] + 1) / (stats[k + "_tried"] + 2) for k in kinds]  # adaptive (ALNS)
+        size = min(70, int(a.size * 1.25 ** (fails // 5)))  # grow neighbourhoods while stagnating
+        kind, free = neighbourhoods(inst, sol, res, rng, rng.randint(max(5, size - 10), size + 15), wts)
         if not free:
             continue
         t0 = time.monotonic()
@@ -106,8 +123,10 @@ def main():
             continue
         r2 = evaluate(inst, cand)
         stats[kind + "_tried"] += 1
+        fails += 1
         if r2["valid"] and r2["score"] < res["score"]:
             stats[kind + "_won"] += 1
+            fails = 0
             print(f"{datetime.datetime.now():%H:%M:%S} {name} {kind:7s} |free|={len(free):2d} pc={pc} rl={rl} "
                   f"{res['score']} -> {r2['score']} ({time.monotonic() - t0:.0f}s)", flush=True)
             cur = evaluate(inst, json.load(open(path))) if os.path.exists(path) else {"score": None}
