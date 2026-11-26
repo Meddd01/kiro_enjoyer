@@ -38,7 +38,7 @@ def score(inst, path):
 def collect(insts):
     best, alln = {}, {}
     for n in NAMES:
-        paths = set(glob.glob(f"solutions/**/{n}.json", recursive=True)) | set(glob.glob(f"codex_teamwarmup/{n}.json"))
+        paths = {p for p in glob.glob(f"solutions/**/{n}.json", recursive=True) if "history" not in p} | set(glob.glob(f"codex_teamwarmup/{n}.json"))
         cands = []
         for p in sorted(paths):
             s, w = score(insts[n], p)
@@ -52,7 +52,7 @@ def collect(insts):
 
 def workers():
     rows = []
-    for p in sorted(glob.glob("runs/claude/warm*.txt") + glob.glob("runs/claude/lns*.txt")):
+    for p in sorted(glob.glob("runs/claude/warm*.txt") + glob.glob("runs/claude/lns*.txt") + glob.glob("runs/claude/smoke*.txt")):
         age = time.time() - os.path.getmtime(p)
         if age > 1800 and "warm" not in p:
             continue
@@ -88,6 +88,15 @@ def fetch_board():
 
 
 def loop():
+    while True:
+        try:
+            _loop()
+        except Exception as exc:  # never let the data thread die
+            print("loop error:", repr(exc), flush=True)
+            time.sleep(5)
+
+
+def _loop():
     insts = {n: json.load(open(f"instances/{n}.json")) for n in NAMES}
     hist = json.load(open(HIST)) if os.path.exists(HIST) else []
     while True:
@@ -104,7 +113,12 @@ def loop():
                 "rank_if_submitted": (1 + sum(1 for r in ranked if r["team"] != TEAM and r["total"] < total)) if total and ranked else None}
         tmp = os.path.join(DIR, "live.json.tmp")
         json.dump(live, open(tmp, "w"))
-        os.replace(tmp, os.path.join(DIR, "live.json"))
+        for _ in range(20):  # Windows: the HTTP thread may hold live.json open for a moment
+            try:
+                os.replace(tmp, os.path.join(DIR, "live.json"))
+                break
+            except PermissionError:
+                time.sleep(0.25)
         time.sleep(10)
 
 

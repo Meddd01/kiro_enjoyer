@@ -186,6 +186,42 @@ def big_or_tail(inst, sol, res, rng, mode, size, frac):
     return f"big-{block}", free
 
 
+LEX = {"on": False, "w": {}, "eps": 1e-3}
+
+
+def install_lex(ms):
+    """Runtime patch of Codex's Model.run (no file edit): objective = worst + eps * sum_s w_s * C_s, so repairs keep
+    pushing the tied near-max scenarios down instead of stopping on the max plateau."""
+    import numpy as np
+    orig = ms.Model.run
+
+    def run(self, deadline, seed, start):
+        if not LEX["on"]:
+            return orig(self, deadline, seed, start)
+        zeros = np.zeros
+
+        def lex_zeros(n, *args, **kw):
+            arr = zeros(n, *args, **kw)
+            if n == len(self.lower):
+                tot = sum(LEX["w"].get(sid, 0.05) for sid in self.scenario_rows) or 1.0
+                for sid, idx in self.scenario_rows.items():
+                    w = LEX["eps"] * LEX["w"].get(sid, 0.05) / tot
+                    for c, a_ in self.rows[idx][0].items():
+                        if c != self.worst:
+                            arr[c] += w * a_
+            return arr
+        ms.np.zeros = lex_zeros
+        try:
+            return orig(self, deadline, seed, start)
+        finally:
+            ms.np.zeros = zeros
+    ms.Model.run = run
+
+
+def topk_sum(res, k=8):
+    return sum(sorted(res["scenario_costs"].values(), reverse=True)[:k])
+
+
 def kick(inst, problem, ms, sol, rng):
     """ILS perturbation: short low-temperature SA on the allocation, then global split+reuse polish."""
     import heuristic
@@ -211,9 +247,10 @@ def main():
     ap.add_argument("--size", type=int, default=25, help="max free flows per neighbourhood")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--kick", type=int, default=0, help="ILS: after this many consecutive failures, perturb (0=off)")
-    ap.add_argument("--mode", default="alns", choices=["alns", "big", "tail", "mix"],
+    ap.add_argument("--mode", default="alns", choices=["alns", "big", "tail", "mix", "cross"],
                     help="alns: adaptive small neighbourhoods; big: exact repair of 20-40%% of flows; "
                          "tail: drivers of the worst scenarios; mix: alternate big/tail/alns")
+    ap.add_argument("--lex", action="store_true", help="lexicographic repair: max, then tied top scenarios")
     ap.add_argument("--destroy", default="0.2-0.4", help="big mode: fraction range of flows freed")
     ap.add_argument("--init", default="solutions/claude", help="folder with the starting <name>.json")
     ap.add_argument("--out", default="solutions/claude", help="folder where improved <name>.json is written")
@@ -233,6 +270,8 @@ def main():
     res = evaluate(inst, sol)
     assert res["valid"]
     problem = Problem(inst)
+    if a.lex:
+        install_lex(ms)
     rng = random.Random(a.seed)
     t_end = time.monotonic() + a.time
     stats = Counter()
@@ -249,7 +288,30 @@ def main():
                 fails = 0
         mode = a.mode if a.mode != "mix" else rng.choice(["big", "tail", "alns"])
         t0 = time.monotonic()
-        if mode == "alns":
+        if mode == "cross":  # elite pool + MILP crossover; offspring compared with both parents
+            import pool as pool_mod
+            if stats["cross_tried"] % 5 == 0:
+                elite = pool_mod.load_pool(inst, name)
+            if len(elite) < 2:
+                print("pool too small for crossover", flush=True)
+                break
+            A, B = rng.sample(elite[: min(len(elite), 8)], 2)
+            if B["score"] < A["score"]:
+                A, B = B, A
+            child, nfree = pool_mod.crossover(inst, problem, ms, A, B, rng, min(t_end, time.monotonic() + a.sub))
+            stats["cross_tried"] += 1
+            fails += 1
+            if child is None:
+                continue
+            rc = evaluate(inst, child)
+            tag = "BEATS-BOTH" if rc["score"] < A["score"] else ("beats-worse" if rc["score"] < B["score"] else "no")
+            print(f"{datetime.datetime.now():%H:%M:%S} {name} XOVER {A['score']} x {B['score']} |free|={nfree} "
+                  f"-> {rc['score']} {tag}", flush=True)
+            if rc["valid"] and rc["score"] < res["score"]:
+                kind, free, cand, r2, pc, rl = "cross", set(), child, rc, None, None
+            else:
+                continue
+        elif mode == "alns":
             kinds = ["site", "worst", "carrier", "spot", "regret", "topk", "port"]
             wts = [(stats[k + "_won"] + 1) / (stats[k + "_tried"] + 2) for k in kinds]  # adaptive (ALNS)
             size = min(70, int(a.size * 1.25 ** (fails // 5)))  # grow neighbourhoods while stagnating
@@ -261,18 +323,38 @@ def main():
             lo, hi = map(float, a.destroy.split("-"))
             kind, free = big_or_tail(inst, sol, res, rng, mode, rng.randint(a.size, 2 * a.size), rng.uniform(lo, hi))
             pc, rl = rng.choice([(2, 6), (1, 5)]) if mode == "big" else rng.choice([(2, 6), (3, 10)])
-        if not free:
+        if mode != "cross" and not free:
             continue
+        if a.lex:
+            sc_ = res["scenario_costs"]
+            top_ = max(sc_.values())
+            LEX.update(on=True, w={s_: (1.0 if c_ >= top_ * 0.995 else 0.05) for s_, c_ in sc_.items()})
         try:
+            if mode == "cross":
+                raise StopIteration
             trial = ms._candidate(problem, sol, min(t_end, time.monotonic() + a.sub), rng.randrange(10**6),
                                   free=free, per_carrier=pc, route_limit=rl, reuse=True)
             cand = ms.pack(*ms.unpack(ms._best(inst, problem, sol, trial)))
+        except StopIteration:
+            pass
         except Exception as exc:  # solver hiccup: skip this neighbourhood
             print("neighbourhood failed:", repr(exc), file=sys.stderr)
             continue
-        r2 = evaluate(inst, cand)
-        stats[kind + "_tried"] += 1
-        fails += 1
+        if mode != "cross":
+            if a.lex and trial is not None:  # take the raw repair (plateau moves), not only strict improvements
+                raw = ms.pack(*ms.unpack(trial[0]))
+                rr = evaluate(inst, raw)
+                if rr["valid"] and rr["score"] == res["score"] and topk_sum(rr) < topk_sum(res):
+                    stats[kind + "_plateau"] += 1
+                    print(f"{datetime.datetime.now():%H:%M:%S} {name} PLATEAU {kind} top8 {topk_sum(res)} -> "
+                          f"{topk_sum(rr)}", flush=True)
+                    sol, res = raw, rr
+                    fails = max(0, fails - 2)
+                elif rr["valid"] and rr["score"] < res["score"]:
+                    cand = raw
+            r2 = evaluate(inst, cand)
+            stats[kind + "_tried"] += 1
+            fails += 1
         if r2["valid"] and r2["score"] < res["score"]:
             stats[kind + "_won"] += 1
             fails = 0
