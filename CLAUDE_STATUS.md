@@ -85,6 +85,13 @@ Codex `milp_solver._candidate(free=..., per_carrier 2-3, route_limit 6-12, reuse
 | 15:05 | full-catalogue (all routes) 14-flow neighbourhood, 40s | small improvement on strikes | added to LNS mix |
 | 15:11 | round 4: 4 LNS from team best 833.01M (rel x2, strikes, alliances), ALNS + topk + full-catalogue | running | - |
 | 15:13 | ILS kick (SA 30s + global polish) after 12 fails, alliances, 5th process | running | compare vs plain LNS on alliances |
+| 15:25 | big mode (20-40% exact repair) smoke 3x120s | 1 win (-109); HiGHS times out on 60-70 flows | kept at 15-25%, 110s |
+| 15:29 | tail mode (scenario cost attribution drivers) smoke 3x120s | 1 win (-82) | kept |
+| 15:33 | crossover (elite pool) | pool = 2 diverse members; 60-flow repair 104s, no child | dropped (0 wins) |
+| 15:34 | **lexicographic repair** (max, then tied top scenarios) + plateau acceptance | strict wins + plateau moves (top-8 -145k) | main bet: all families |
+| 15:38 | lex portfolio 6 slots (portfolio.py) | 832.31M -> 831.99M in 15 min; alliances slot 43 wins | running until 17:30 |
+| 15:47 | Codex solve() from scratch, strikes, 2 seeds x300s | 480.2M both (far worse basin) | rejected |
+| 15:53 | wide lex workers (rel size 50, strikes 45, sub 60) | running | A/B vs 25-flow slots |
 Team best per instance is always the min over `solutions/**/<name>.json` + `codex_teamwarmup/` (evaluator-checked);
 `runs/claude/relaunch.sh ROUND` snapshots it into `solutions/team_best/` and restarts the workers.
 
