@@ -1,7 +1,7 @@
 """Finite-scenario route allocation with exact automatic rerouting."""
 
 from collections import defaultdict
-from itertools import combinations, product
+from itertools import combinations
 import logging
 from math import inf
 from time import monotonic
@@ -10,6 +10,7 @@ import highspy
 import numpy as np
 
 from common import Problem, pack, unpack
+from reuse import ReuseArcs
 
 
 log = logging.getLogger(__name__)
@@ -247,44 +248,14 @@ def _allocation(model, problem, incumbent, free, support_only, per_carrier, rout
     return nominal, selected, realized, starts
 
 
-def _reuse_arcs(model, problem, nominal):
-    inbound, outbound = defaultdict(list), defaultdict(list)
-    for r in nominal:
-        i, j = problem.ends[r]
-        m = problem.routes[r]["carrier"]
-        inbound[m, j].append(r)
-        outbound[m, i].append(r)
-    by_from, by_to, by_site = defaultdict(list), defaultdict(list), defaultdict(list)
-    arcs = {}
-    for (carrier, site), arriving in inbound.items():
-        cap = problem.sites[site]["reutil"]
-        if not cap:
-            continue
-        for i, j in product(arriving, outbound[carrier, site]):
-            savings = problem.truck_in[i] + problem.truck_out[j]
-            ci, qi = nominal[i]
-            cj, qj = nominal[j]
-            hi = min(cap, qi if ci is None else model.upper[ci], qj if cj is None else model.upper[cj])
-            column = model.var(hi=hi, integer=True)
-            arcs[i, j] = (column, savings, problem.mask[i] | problem.mask[j])
-            by_from[i].append((column, 1))
-            by_to[j].append((column, 1))
-            by_site[site].append((column, 1))
-    for side in (by_from, by_to):
-        for r, terms in side.items():
-            column, amount = nominal[r]
-            model.row([*terms, (column, -amount)], hi=0)
-    for site, terms in by_site.items():
-        model.row(terms, hi=problem.sites[site]["reutil"])
-    return arcs
-
-
-def _build(problem, x, free, support_only, per_carrier, reuse, route_limit=None, safe_only=False):
+def _build(problem, x, free, support_only, per_carrier, reuse, route_limit=None,
+           safe_only=False, compress_reuse=True):
     model = Model()
     nominal, selected, realized, starts = _allocation(
         model, problem, x, free, support_only, per_carrier, route_limit, safe_only
     )
-    arcs = _reuse_arcs(model, problem, nominal) if reuse else {}
+    reuse_plan = ReuseArcs(model, problem, nominal, compress_reuse) if reuse else None
+    arcs = reuse_plan.arcs.values() if reuse_plan is not None else ()
     activations = {}
     nominal_carriers = defaultdict(int)
     for r in nominal:
@@ -347,10 +318,10 @@ def _build(problem, x, free, support_only, per_carrier, reuse, route_limit=None,
                     c, a = active(routes)
                     model.row([*volume, (c, -a * problem.minimum[m])], lo=0)
         costs.extend(
-            (c, -saving) for c, saving, mask in arcs.values() if not mask & (1 << s)
+            (c, -saving) for c, saving, mask in arcs if not mask & (1 << s)
         )
         model.scenario_rows[scenario_id] = seen[affected] = model.cost(costs)
-    return model, nominal, arcs, starts
+    return model, nominal, reuse_plan, starts
 
 
 def _scenario_costs(problem, solution):
@@ -362,12 +333,16 @@ def _scenario_costs(problem, solution):
         return None
     if sum(x.values()) != sum(f["n"] for f in problem.flows):
         return None
-    model, _, arcs, _ = _build(problem, x, set(), False, None, bool(y))
-    if any(pair not in arcs for pair in y):
-        return None
+    model, _, reuse_plan, _ = _build(
+        problem, x, set(), False, None, bool(y), compress_reuse=False
+    )
     point = [0] * len(model.lower)
-    for pair, n in y.items():
-        point[arcs[pair][0]] = n
+    if reuse_plan is not None:
+        values = reuse_plan.start(y)
+        if values is None:
+            return None
+        for c, n in values.items():
+            point[c] = n
     if model.check(point) is None:
         return None
     return {s: model.scenario_cost(point, i) for s, i in model.scenario_rows.items()}
@@ -379,23 +354,26 @@ def _score(problem, solution):
 
 
 def _candidate(problem, initial, deadline, seed, *, free, support_only=False,
-               per_carrier=None, reuse=False, route_limit=None, safe_only=False):
+               per_carrier=None, reuse=False, route_limit=None, safe_only=False,
+               compress_reuse=True):
     if deadline <= monotonic():
         return None
     x, y = unpack(initial) if initial is not None else ({}, {})
-    model, nominal, arcs, start = _build(
-        problem, x, free, support_only, per_carrier, reuse, route_limit, safe_only
+    model, nominal, reuse_plan, start = _build(
+        problem, x, free, support_only, per_carrier, reuse, route_limit, safe_only,
+        compress_reuse,
     )
-    for pair, (c, _, _) in arcs.items():
-        start[c] = y.get(pair, 0)
+    if reuse_plan is not None:
+        values = reuse_plan.start(y)
+        if values is not None:
+            start.update(values)
     result = model.run(deadline, seed, start if initial is not None else {})
     if result is None:
         return None
     point, score = result
-    return pack(
-        {r: n if c is None else point[c] for r, (c, n) in nominal.items()},
-        {pair: point[c] for pair, (c, _, _) in arcs.items()},
-    ), score
+    x = {r: n if c is None else point[c] for r, (c, n) in nominal.items()}
+    y = reuse_plan.extract(point, x) if reuse_plan is not None else {}
+    return pack(x, y), score
 
 
 def _independent_score(instance, problem, solution):
@@ -511,7 +489,9 @@ if __name__ == "__main__":
     cli.add_argument("instance")
     cli.add_argument("output", type=Path)
     cli.add_argument("--initial")
-    cli.add_argument("--free-flows", type=int, nargs="*")
+    modes = cli.add_mutually_exclusive_group()
+    modes.add_argument("--free-flows", type=int, nargs="*")
+    modes.add_argument("--fixed-support", action="store_true")
     cli.add_argument("--time", type=float, default=120)
     cli.add_argument("--seed", type=int, default=0)
     args = cli.parse_args()
@@ -519,14 +499,20 @@ if __name__ == "__main__":
     instance = load_instance(args.instance)
     initial = load_instance(args.initial) if args.initial else None
     problem = Problem(instance)
-    if args.free_flows is None:
-        solution = solve(instance, initial, args.time, args.seed)
-    else:
+    if args.free_flows is not None:
         if initial is None:
             cli.error("--free-flows requires --initial")
         solution = _neighborhood(
             instance, problem, initial, set(args.free_flows), monotonic() + args.time, args.seed
         )
+    elif args.fixed_support:
+        if initial is None or _independent_score(instance, problem, initial) is None:
+            cli.error("--fixed-support requires a feasible --initial solution")
+        trial = _candidate(problem, initial, monotonic() + args.time, args.seed,
+                           free={f["id"] for f in problem.flows}, support_only=True, reuse=True)
+        solution = _best(instance, problem, initial, trial)
+    else:
+        solution = solve(instance, initial, args.time, args.seed)
     costs = _scenario_costs(problem, solution)
     if costs is None:
         raise RuntimeError("The solution failed the exact model checks")

@@ -95,6 +95,20 @@ class AllocationTests(unittest.TestCase):
         self.assertEqual([row["route"] for row in result["x"]], [0, 1])
         self.assertEqual(_score(p, result), 92)
 
+    def test_compressed_integer_reuse_preserves_route_caps_and_score(self):
+        instance = tiny(demand=1, scenarios=((),))
+        instance["sites"][0]["reutil"] = 5
+        instance["flows"].append({"id": 1, "t_dep": 0, "t_arr": 0, "n": 4, "routes": [2]})
+        instance["routes"].append(dict(instance["routes"][1], id=2, flow=1))
+        p = Problem(instance)
+        initial = pack({1: 1, 2: 4}, {})
+        compressed, score = _candidate(p, initial, monotonic() + 4, 0, free=set(), reuse=True)
+        _, direct_score = _candidate(p, initial, monotonic() + 4, 0,
+                                     free=set(), reuse=True, compress_reuse=False)
+        self.assertEqual(_score(p, compressed), direct_score)
+        self.assertEqual(score, direct_score)
+        self.assertEqual(compressed, pack({1: 1, 2: 4}, {(1, 1): 1, (2, 2): 4}))
+
 
 if __name__ == "__main__":
     unittest.main()
