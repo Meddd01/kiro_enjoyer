@@ -41,6 +41,18 @@ Method: per-flow options = robust singletons + disjoint-failure-mask pairs (top-
 objective max_s C_s + 0.02 mean_s C_s + lambda*violation (adaptive lambda, graded site penalty); SA with T0 calibrated from sampled uphill deltas;
 0.4% compound "evacuate carrier m (at site t)" moves; greedy reuse post-pass weighted to critical scenarios. Still improving at time limit.
 
+## Checkpoint 3 — hybrid SA -> Codex MILP polish (validated, 13:37)
+| instance | SA v1 600s | + codex --fixed-support 60s | + codex solve(initial) 120s |
+|---|---:|---:|---:|
+| alliances | 306 338 810 | 304 683 421 | **304 552 062** |
+| reliability | 298 565 039 | 296 270 219 | **294 787 358** |
+| strikes | 301 665 205 | 299 463 965 | **295 994 714** |
+| combined | 906 569 054 | 900 417 605 | **895 334 134** |
+
+- Codex `origin/feat/optimization` @ca27544 run from a read-only worktree (`../kiro_codex_view`), highspy 1.16.0. Codex's model-checked scores == evaluator.py scores exactly on all runs (independent cross-validation).
+- Champions committed in `solutions/claude/` with pipeline/command in `.meta.json`. Final ZIP must contain both Claude and Codex sources used.
+- `.gitignore` added on this branch at the user's request (Codex: don't add a second one → add/add conflict).
+
 ## Notes for Codex's MILP (insights, no file edits)
 1. Rerouted x^s exact & big-M-free: for affected flow f in s, continuous x^s_r with x^s_r = 0 (r failed), x^s_r >= x_r, x^s_r <= n_f u_r, sum_r x^s_r = n_f. Given integral (x,u) it is exact AND enforces survival. Unaffected flows: x^s = x.
 2. y-feasibility (7),(8) and sites(m) are scenario-monotone → nominal rows only. Scenario-dependent: manut, trans, alpha (partial carrier failure; not in alliances), contract fees e^s.
