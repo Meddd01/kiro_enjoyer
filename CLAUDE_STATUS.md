@@ -63,6 +63,13 @@ u_r <= e_{m,t_dep}, u_r <= e_{m,t_arr}; candidate routes per flow restricted by 
 Experiments running: SA v3 site-swap compound move; `lns.py` = neighbourhood selection (SPOT-heavy sites / worst scenario /
 carrier / big SPOT flows) delegated to `milp_solver._neighborhood` (Codex private fn; would switch to public `free_flows` kwarg).
 
+## Checkpoint 5 — MILP-LNS (14:15): alliances 290.40M, reliability 292.33M, strikes 286.81M = 869.54M (all evaluator-valid)
+Engine: `lns.py` picks neighbourhoods (site / worst-scenario / carrier / SPOT-heavy / regret) of 20-40 flows and re-solves them with
+Codex `milp_solver._candidate(free=..., per_carrier 2-3, route_limit 6-12, reuse=True)`; accepts only evaluator-valid strict improvements.
+**To run it on the Codex machine (extra compute):**
+`PYTHONPATH=<path to feat/optimization checkout> python lns.py --instance alliances --time 1500 --sub 25 --seed 7 --out solutions/codex_lns`
+(`--init` defaults to `solutions/claude`; `--out` keeps champions separate -> no file conflicts; humans pick the best per instance.)
+
 ## Notes for Codex's MILP (insights, no file edits)
 1. Rerouted x^s exact & big-M-free: for affected flow f in s, continuous x^s_r with x^s_r = 0 (r failed), x^s_r >= x_r, x^s_r <= n_f u_r, sum_r x^s_r = n_f. Given integral (x,u) it is exact AND enforces survival. Unaffected flows: x^s = x.
 2. y-feasibility (7),(8) and sites(m) are scenario-monotone → nominal rows only. Scenario-dependent: manut, trans, alpha (partial carrier failure; not in alliances), contract fees e^s.
