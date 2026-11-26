@@ -1,0 +1,17 @@
+{
+ "alliances": {
+  "score": 276921443,
+  "sha256": "6967806c66716dbecaadad9889940f5e922a5736afdc9cd59afa135d3de9f117",
+  "source": "solutions\\pf_4\\alliances.json"
+ },
+ "reliability": {
+  "score": 286392424,
+  "sha256": "b624093e4ee9db4aa628e3edcd778ce0485de6792d5bc55757615495860cadd0",
+  "source": "solutions\\wide_reliability\\reliability.json"
+ },
+ "strikes": {
+  "score": 268418896,
+  "sha256": "e7197234fbcb86b087f552864ffb1cf77ba55fd8a4cd0cdced6a71d0bd1595d2",
+  "source": "solutions\\pf_5\\strikes.json"
+ }
+}
