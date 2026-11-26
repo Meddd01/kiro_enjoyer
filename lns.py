@@ -7,6 +7,7 @@ Needs Codex files (milp_solver.py, common.py, reuse.py) importable, e.g. PYTHONP
 import argparse
 import datetime
 import json
+import math
 import random
 import sys
 import time
@@ -76,6 +77,23 @@ def neighbourhoods(inst, sol, res, rng, size, weights=None):
     return kind, set(free[:size])
 
 
+def kick(inst, problem, ms, sol, rng):
+    """ILS perturbation: short low-temperature SA on the allocation, then global split+reuse polish."""
+    import heuristic
+    md = heuristic.Model(inst)
+    opts = heuristic._opt_from_solution(md, sol)
+    true, best = heuristic.search(md, opts, 30.0, rng.randrange(10**6), reheat=0.05)
+    if best is None or true == math.inf:
+        return None
+    st = heuristic.State(md)
+    for f, o in enumerate(best):
+        st.set(f, o)
+    cand = {"x": [{"route": r, "n": q} for r, q in sorted(st.x_dict().items())], "y": []}
+    trial = ms._candidate(problem, cand, time.monotonic() + 60, rng.randrange(10**6),
+                          free={f["id"] for f in inst["flows"]}, support_only=True, reuse=True)
+    return ms.pack(*ms.unpack(trial[0])) if trial else cand
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--instance", required=True)
@@ -83,6 +101,7 @@ def main():
     ap.add_argument("--sub", type=float, default=20, help="seconds per neighbourhood solve")
     ap.add_argument("--size", type=int, default=25, help="max free flows per neighbourhood")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--kick", type=int, default=0, help="ILS: after this many consecutive failures, perturb (0=off)")
     ap.add_argument("--init", default="solutions/claude", help="folder with the starting <name>.json")
     ap.add_argument("--out", default="solutions/claude", help="folder where improved <name>.json is written")
     a = ap.parse_args()
@@ -106,6 +125,15 @@ def main():
     stats = Counter()
     fails = 0
     while time.monotonic() + 3 < t_end:
+        if a.kick and fails >= a.kick and time.monotonic() + 150 < t_end:
+            kicked = kick(inst, problem, ms, sol, rng)
+            rk = evaluate(inst, kicked) if kicked else None
+            if rk and rk["valid"]:
+                print(f"{datetime.datetime.now():%H:%M:%S} {name} KICK {res['score']} -> {rk['score']}", flush=True)
+                sol, res, fails = kicked, rk, 0
+                stats["kicks"] += 1
+            else:
+                fails = 0
         kinds = ["site", "worst", "carrier", "spot", "regret", "topk"]
         wts = [(stats[k + "_won"] + 1) / (stats[k + "_tried"] + 2) for k in kinds]  # adaptive (ALNS)
         size = min(70, int(a.size * 1.25 ** (fails // 5)))  # grow neighbourhoods while stagnating

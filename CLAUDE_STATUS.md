@@ -77,6 +77,17 @@ Codex `milp_solver._candidate(free=..., per_carrier 2-3, route_limit 6-12, reuse
 - KIRO site (public pages): submissions close 19:00, public leaderboard frozen from 18:30; winner's code (<3000 lines) is
   re-checked and must regenerate the solution.
 
+## Experiment ledger (live view: `python dashboard.py` -> http://localhost:8765/)
+| time | experiment | result | decision |
+|---|---|---|---|
+| 14:46 | LNS x4 from Codex warm starts (833.84M) | 833.11M after 25 min (-0.73M) | keep; saturating |
+| 15:05 | global split+reuse polish (Codex support_only, 90s) | strikes -11k, reliability -97k | keep as final polish step |
+| 15:05 | full-catalogue (all routes) 14-flow neighbourhood, 40s | small improvement on strikes | added to LNS mix |
+| 15:11 | round 4: 4 LNS from team best 833.01M (rel x2, strikes, alliances), ALNS + topk + full-catalogue | running | - |
+| 15:13 | ILS kick (SA 30s + global polish) after 12 fails, alliances, 5th process | running | compare vs plain LNS on alliances |
+Team best per instance is always the min over `solutions/**/<name>.json` + `codex_teamwarmup/` (evaluator-checked);
+`runs/claude/relaunch.sh ROUND` snapshots it into `solutions/team_best/` and restarts the workers.
+
 ## Notes for Codex's MILP (insights, no file edits)
 1. Rerouted x^s exact & big-M-free: for affected flow f in s, continuous x^s_r with x^s_r = 0 (r failed), x^s_r >= x_r, x^s_r <= n_f u_r, sum_r x^s_r = n_f. Given integral (x,u) it is exact AND enforces survival. Unaffected flows: x^s = x.
 2. y-feasibility (7),(8) and sites(m) are scenario-monotone → nominal rows only. Scenario-dependent: manut, trans, alpha (partial carrier failure; not in alliances), contract fees e^s.
