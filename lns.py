@@ -35,7 +35,7 @@ def neighbourhoods(inst, sol, res, rng, size, weights=None):
     used = {}
     for e in sol["x"]:
         used.setdefault(routes[e["route"]]["flow"], []).append(e["route"])
-    kinds = ["site", "worst", "carrier", "spot", "regret", "topk"]
+    kinds = ["site", "worst", "carrier", "spot", "regret", "topk", "port"]
     kind = rng.choices(kinds, weights=weights or [1.0] * len(kinds))[0]
     if kind == "site":  # sites weighted by SPOT volume touching them
         w = Counter()
@@ -65,6 +65,38 @@ def neighbourhoods(inst, sol, res, rng, size, weights=None):
         free = [f for f, _ in hits.most_common(3 * size)]
         rng.shuffle(free)
         free = sorted(free, key=lambda f: -hits[f])[: 2 * size]
+    elif kind == "port":  # saturated port + SPOT flows whose cheap real routes need it (capacity swap)
+        load = Counter()
+        xs = {e["route"]: e["n"] for e in sol["x"]}
+        for sc_ in inst["scenarios"]:
+            failed = set(sc_["routes"])
+            ls = Counter()
+            for f, rs in used.items():
+                alive = [r for r in rs if r not in failed]
+                for r in alive:
+                    q = xs[r] if len(alive) == len(rs) else flows[f]["n"]
+                    ls[routes[r]["p_dep"]] += q
+                    ls[routes[r]["p_arr"]] += q
+            for p_, v in ls.items():
+                load[p_] = max(load[p_], v)
+        cost = unit_costs(inst)
+        want = Counter()
+        for f, rs in used.items():
+            if len(rs) == 1 and routes[rs[0]]["carrier"] == spot:
+                for r in flows[f]["routes"]:
+                    if routes[r]["carrier"] != spot and cost[r] < cost[rs[0]]:
+                        for p_ in (routes[r]["p_dep"], routes[r]["p_arr"]):
+                            if load[p_] >= 0.98 * inst["ports"][p_]["manut"]:
+                                want[p_] += flows[f]["n"] * (cost[rs[0]] - cost[r])
+        if not want:
+            return kind, set()
+        p_ = rng.choices(list(want), weights=list(want.values()))[0]
+        seekers = [f for f, rs in used.items() if len(rs) == 1 and routes[rs[0]]["carrier"] == spot
+                   and any(p_ in (routes[r]["p_dep"], routes[r]["p_arr"]) for r in flows[f]["routes"])]
+        holders = [f for f, rs in used.items() if any(p_ in (routes[r]["p_dep"], routes[r]["p_arr"]) for r in rs)]
+        rng.shuffle(holders)
+        free = seekers[: size // 2] + holders
+        return kind, set(free[: size + 10])
     elif kind == "regret":  # flows paying most above their cheapest candidate route (nominal inefficiency)
         cost = unit_costs(inst)
         xs = {e["route"]: e["n"] for e in sol["x"]}
@@ -134,7 +166,7 @@ def main():
                 stats["kicks"] += 1
             else:
                 fails = 0
-        kinds = ["site", "worst", "carrier", "spot", "regret", "topk"]
+        kinds = ["site", "worst", "carrier", "spot", "regret", "topk", "port"]
         wts = [(stats[k + "_won"] + 1) / (stats[k + "_tried"] + 2) for k in kinds]  # adaptive (ALNS)
         size = min(70, int(a.size * 1.25 ** (fails // 5)))  # grow neighbourhoods while stagnating
         kind, free = neighbourhoods(inst, sol, res, rng, rng.randint(max(5, size - 10), size + 15), wts)
