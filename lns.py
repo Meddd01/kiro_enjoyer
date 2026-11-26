@@ -6,6 +6,8 @@ Needs Codex files (milp_solver.py, common.py, reuse.py) importable, e.g. PYTHONP
 """
 import argparse
 import datetime
+import glob
+import os
 import json
 import math
 import shutil
@@ -218,6 +220,34 @@ def install_lex(ms):
     ms.Model.run = run
 
 
+def install_union(ms, inst, folders):
+    """Recombination: every repair may also use any route that appears (for that flow) in other validated solutions
+    (union of supports). Codex's _candidates uses `warm` only as a set of must-allow routes, so we extend that set;
+    the MIP start still comes from the real incumbent."""
+    routes = inst["routes"]
+    union, n_sol = {}, 0
+    for folder in folders:
+        for p_ in glob.glob(os.path.join(folder, "**", f"{inst['meta']['name']}.json"), recursive=True):
+            try:
+                sol_ = json.load(open(p_))
+            except (OSError, ValueError):
+                continue
+            if not evaluate(inst, sol_)["valid"]:
+                continue
+            n_sol += 1
+            for e in sol_["x"]:
+                union.setdefault(routes[e["route"]]["flow"], set()).add(e["route"])
+    orig = ms._candidates
+
+    def cand(problem, flow, warm, *args, **kw):
+        extra = union.get(flow["id"], ())
+        w2 = dict(warm)
+        w2.update({r: 0 for r in extra if r not in w2})
+        return orig(problem, flow, w2, *args, **kw)
+    ms._candidates = cand
+    return n_sol, sum(len(v) for v in union.values())
+
+
 def topk_sum(res, k=8):
     return sum(sorted(res["scenario_costs"].values(), reverse=True)[:k])
 
@@ -250,6 +280,8 @@ def main():
     ap.add_argument("--mode", default="alns", choices=["alns", "big", "tail", "mix", "cross"],
                     help="alns: adaptive small neighbourhoods; big: exact repair of 20-40%% of flows; "
                          "tail: drivers of the worst scenarios; mix: alternate big/tail/alns")
+    ap.add_argument("--union", default="", help="comma-separated folders of solutions whose routes join the candidates")
+    ap.add_argument("--kinds", default="", help="comma-separated subset of ALNS neighbourhood kinds")
     ap.add_argument("--lex", action="store_true", help="lexicographic repair: max, then tied top scenarios")
     ap.add_argument("--destroy", default="0.2-0.4", help="big mode: fraction range of flows freed")
     ap.add_argument("--init", default="solutions/claude", help="folder with the starting <name>.json")
@@ -272,6 +304,9 @@ def main():
     problem = Problem(inst)
     if a.lex:
         install_lex(ms)
+    if a.union:
+        ns, nr = install_union(ms, inst, a.union.split(","))
+        print(f"union candidates: {ns} solutions, {nr} flow-route pairs", flush=True)
     rng = random.Random(a.seed)
     t_end = time.monotonic() + a.time
     stats = Counter()
@@ -314,6 +349,8 @@ def main():
         elif mode == "alns":
             kinds = ["site", "worst", "carrier", "spot", "regret", "topk", "port"]
             wts = [(stats[k + "_won"] + 1) / (stats[k + "_tried"] + 2) for k in kinds]  # adaptive (ALNS)
+            if a.kinds:
+                wts = [w if k in a.kinds.split(",") else 0.0 for k, w in zip(kinds, wts)]
             size = min(70, int(a.size * 1.25 ** (fails // 5)))  # grow neighbourhoods while stagnating
             kind, free = neighbourhoods(inst, sol, res, rng, rng.randint(max(5, size - 10), size + 15), wts)
             pc, rl = rng.choice([(2, 6), (2, 8), (3, 10), (3, 12), (None, None)])
