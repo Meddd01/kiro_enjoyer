@@ -113,7 +113,9 @@ def main():
         if not free:
             continue
         t0 = time.monotonic()
-        pc, rl = rng.choice([(2, 6), (2, 8), (3, 10), (3, 12)])
+        pc, rl = rng.choice([(2, 6), (2, 8), (3, 10), (3, 12), (None, None)])
+        if rl is None:  # full candidate catalogue: keep the neighbourhood small
+            free = set(rng.sample(sorted(free), min(len(free), 14)))
         try:
             trial = ms._candidate(problem, sol, min(t_end, time.monotonic() + a.sub), rng.randrange(10**6),
                                   free=free, per_carrier=pc, route_limit=rl, reuse=True)
