@@ -1,8 +1,8 @@
 {
   "instance": "alliances",
-  "score": 275672272,
+  "score": 275657389,
   "valid": true,
   "scenario_costs_match": true,
-  "sha256": "c61ee67a447442bb92125fcbbe5de86350d6ef809beaf3689f82162d264776d4",
-  "source": "C:\\Users\\ahais\\Desktop\\New folder (2)\\kiro_enjoyer\\runs\\optimization\\audit-v1\\promote\\alliances.json"
+  "sha256": "8ddc4b4c0ebd37d42228c915b0d6a2e880ac9bc1c5e8a36d60aff42e96c93c95",
+  "source": "C:\\Users\\ahais\\Desktop\\New folder (2)\\kiro_enjoyer\\runs\\optimization\\audit-v1\\annealed-825653\\alliances\\alliances.json"
 }
