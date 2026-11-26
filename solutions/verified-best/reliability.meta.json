@@ -1,8 +1,8 @@
 {
   "instance": "reliability",
-  "score": 284645644,
+  "score": 284570648,
   "valid": true,
   "scenario_costs_match": true,
-  "sha256": "d32f0177959cb55e35db7066573c7244004e0c508a048f68739ca2de1136d163",
+  "sha256": "772638d5a73bc4d88764dfb5bfc1ad65ecb3ea8ab629ffad1634428b1bca9d19",
   "source": "C:\\Users\\ahais\\Desktop\\New folder (2)\\kiro_enjoyer\\runs\\optimization\\audit-v1\\promote\\reliability.json"
 }
