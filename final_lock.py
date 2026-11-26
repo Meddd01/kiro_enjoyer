@@ -16,7 +16,7 @@ import zipfile
 from evaluator import evaluate
 
 NAMES = ["alliances", "reliability", "strikes"]
-SOURCES = ["lns.py", "heuristic.py", "baseline.py", "evaluator.py",  # Claude
+SOURCES = ["regenerate.py", "lns.py", "open_carrier.py", "forced_sa.py", "heuristic.py", "baseline.py", "evaluator.py",
            "../kiro_codex_view/milp_solver.py", "../kiro_codex_view/common.py", "../kiro_codex_view/reuse.py"]  # Codex
 
 
@@ -89,12 +89,14 @@ def main():
     print("FINAL TOTAL", total)
     json.dump(report, open("solutions/FINAL/report.json", "w"), indent=1)
     if a.zip:
+        total_lines = sum(1 for src in SOURCES for _ in open(src, encoding="utf-8"))
+        assert total_lines < 3000, f"submission code has {total_lines} lines (limit 3000)"
         lines = 0
         with zipfile.ZipFile("submission_source.zip", "w", zipfile.ZIP_DEFLATED) as z:
             for src in SOURCES:
                 z.write(src, os.path.basename(src))
                 lines += sum(1 for ln in open(src, encoding="utf-8") if ln.strip())
-        print(f"submission_source.zip: {len(SOURCES)} files, {lines} non-empty lines (limit 3000)")
+        print(f"submission_source.zip: {len(SOURCES)} files, {total_lines} lines ({lines} non-empty), limit 3000")
 
 
 if __name__ == "__main__":

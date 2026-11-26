@@ -1,17 +1,17 @@
 {
  "alliances": {
-  "score": 276921443,
-  "sha256": "6967806c66716dbecaadad9889940f5e922a5736afdc9cd59afa135d3de9f117",
-  "source": "solutions\\pf_4\\alliances.json"
+  "score": 276151962,
+  "source": "solutions\\R6_alliances_9103\\alliances.json",
+  "sha256": "93a84c3b39bd2cf00e9552299bcb30fbef154fe12a730cdec39be539e1f7176e"
  },
  "reliability": {
-  "score": 286392424,
-  "sha256": "b624093e4ee9db4aa628e3edcd778ce0485de6792d5bc55757615495860cadd0",
-  "source": "solutions\\wide_reliability\\reliability.json"
+  "score": 285352183,
+  "source": "solutions\\R6_reliability_9104\\reliability.json",
+  "sha256": "b65d5c142a96ab2c0f8a04c76f06ae1c54c1e30184b571a2de764be0697120ef"
  },
  "strikes": {
-  "score": 268418896,
-  "sha256": "e7197234fbcb86b087f552864ffb1cf77ba55fd8a4cd0cdced6a71d0bd1595d2",
-  "source": "solutions\\pf_5\\strikes.json"
+  "score": 265874001,
+  "source": "solutions\\OC_strikes_G\\strikes.json",
+  "sha256": "13aa9a285389725214f0b022c8d8b5b77bfaf821e4ccc365fe40accfd46449be"
  }
 }

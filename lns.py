@@ -32,14 +32,23 @@ def unit_costs(inst):
     return _UC[key]
 
 
+KINDS = ["site", "worst", "carrier", "spot", "regret", "topk", "port", "swap", "open", "bigspot", "unlock"]
+
+
 def neighbourhoods(inst, sol, res, rng, size, weights=None):
     routes, flows, carriers = inst["routes"], inst["flows"], inst["carriers"]
     spot = next(c["id"] for c in carriers if c["name"] == "SPOT")
     used = {}
     for e in sol["x"]:
         used.setdefault(routes[e["route"]]["flow"], []).append(e["route"])
-    kinds = ["site", "worst", "carrier", "spot", "regret", "topk", "port"]
+    kinds = KINDS
     kind = rng.choices(kinds, weights=weights or [1.0] * len(kinds))[0]
+    if kind == "unlock":
+        return unlock(inst, sol, rng, size)
+    if kind == "bigspot":
+        return bigspot(inst, sol, rng, size)
+    if kind in ("swap", "open"):
+        return structural(inst, sol, res, rng, size, kind)
     if kind == "site":  # sites weighted by SPOT volume touching them
         w = Counter()
         for e in sol["x"]:
@@ -110,6 +119,198 @@ def neighbourhoods(inst, sol, res, rng, size, weights=None):
         free = sorted(used, key=lambda f: -flows[f]["n"] * any(routes[r]["carrier"] == spot for r in used[f]))[: 2 * size]
     rng.shuffle(free)
     return kind, set(free[:size])
+
+
+def site_structure(inst, sol):
+    """Carrier site sets S[m], users[(m, t)] (flows using m at site t), volume at (m, t), and per-flow
+    opening gains: gain[(m, t_new)] = sum over flows whose cheapest m-route needs exactly one site t_new outside S[m]
+    of n_f * (current unit cost - that route's unit cost)."""
+    routes, flows, carriers = inst["routes"], inst["flows"], inst["carriers"]
+    spot = next(c["id"] for c in carriers if c["name"] == "SPOT")
+    cost = unit_costs(inst)
+    xs = {e["route"]: e["n"] for e in sol["x"]}
+    S, users, vol = {}, {}, Counter()
+    cur = Counter()
+    for r, n in xs.items():
+        m, f = routes[r]["carrier"], flows[routes[r]["flow"]]
+        cur[f["id"]] += n * cost[r]
+        for t in {f["t_dep"], f["t_arr"]}:
+            S.setdefault(m, set()).add(t)
+            users.setdefault((m, t), set()).add(f["id"])
+            vol[(m, t)] += n
+    gain, gainers = Counter(), {}
+    for f in flows:
+        unit = cur[f["id"]] / f["n"]
+        best = {}
+        for r in f["routes"]:
+            m = routes[r]["carrier"]
+            if m == spot:
+                continue
+            miss = {f["t_dep"], f["t_arr"]} - S.get(m, set())
+            if not miss:
+                continue
+            g = f["n"] * (unit - cost[r])
+            if g > 0:
+                key = (m, frozenset(miss))
+                best[key] = max(best.get(key, 0), g)
+        for (m, miss), g in best.items():
+            for t in miss:  # a flow needing two new sites credits both (half each)
+                gain[(m, t)] += g / len(miss)
+                gainers.setdefault((m, t), Counter())[f["id"]] += g / len(miss)
+    return spot, S, users, vol, gain, gainers
+
+
+def structural(inst, sol, res, rng, size, kind):
+    """'swap': for a carrier at its sites(m) limit, close its lightest site t and open the best-gain site t';
+    'open': for a carrier with free site slots (incl. dormant ones), open the best-gain sites.
+    Frees every flow using m at t plus the top gainers of the new site(s); repair uses full per-carrier routes."""
+    carriers = inst["carriers"]
+    spot, S, users, vol, gain, gainers = site_structure(inst, sol)
+    cands = []
+    for (m, t), g in gain.items():
+        full = len(S.get(m, ())) >= carriers[m]["sites"]
+        if (kind == "swap") == full:
+            cands.append(((m, t), g))
+    if not cands:
+        return kind, set()
+    cands.sort(key=lambda c: -c[1])
+    cands = cands[:25]
+    (m, t_new), g = rng.choices(cands, weights=[c[1] for c in cands])[0]
+    free = set()
+    tag = f"{kind}:{carriers[m]['name'][-1]}+{t_new}"
+    if kind == "swap":
+        light = sorted((vol[(m, t)], t) for t in S[m] if t != t_new)
+        t_old = rng.choice(light[:3])[1]
+        free |= users[(m, t_old)]
+        tag += f"-{t_old}"
+        sites_new = [t_new]
+    else:
+        slots = carriers[m]["sites"] - len(S.get(m, ()))
+        others = sorted(((gg, t) for (mm, t), gg in gain.items() if mm == m and t != t_new), reverse=True)
+        sites_new = [t_new] + [t for _, t in others[: rng.randint(0, max(0, min(3, slots - 1)))]]
+        tag += "".join(f"+{t}" for t in sites_new[1:])
+    pool = Counter()
+    for t in sites_new:
+        pool.update(gainers.get((m, t), {}))
+    room = max(8, size - len(free))
+    free |= {f for f, _ in pool.most_common(room)}
+    touch = [f["id"] for f in inst["flows"] if f["id"] not in free
+             and ({f["t_dep"], f["t_arr"]} & (set(sites_new) | ({t_old} if kind == "swap" else set())))]
+    rng.shuffle(touch)
+    free |= set(touch[: max(0, size - len(free))])
+    return tag, free
+
+
+def bigspot(inst, sol, rng, size):
+    """One big SPOT flow (weighted by n * (SPOT unit - cheapest real unit)) + the flows holding the ports and the
+    carriers of its cheap real routes: room for a full robust pair (each route able to carry n_f alone)."""
+    routes, flows, carriers = inst["routes"], inst["flows"], inst["carriers"]
+    spot = next(c["id"] for c in carriers if c["name"] == "SPOT")
+    cost = unit_costs(inst)
+    xs = {e["route"]: e["n"] for e in sol["x"]}
+    used = {}
+    for r in xs:
+        used.setdefault(routes[r]["flow"], []).append(r)
+    w = {}
+    for f, rs in used.items():
+        sp = sum(xs[r] for r in rs if routes[r]["carrier"] == spot)
+        if sp:
+            real = [cost[r] for r in flows[f]["routes"] if routes[r]["carrier"] != spot]
+            if real:
+                w[f] = sp * max(1, cost[next(r for r in rs if routes[r]["carrier"] == spot)] - min(real))
+    if not w:
+        return "bigspot", set()
+    top = sorted(w, key=w.get, reverse=True)[:8]
+    f0 = rng.choices(top, weights=[w[f] for f in top])[0]
+    cheap = sorted((r for r in flows[f0]["routes"] if routes[r]["carrier"] != spot), key=lambda r: cost[r])[:8]
+    ports = {routes[r][k] for r in cheap for k in ("p_dep", "p_arr")}
+    ms_ = {routes[r]["carrier"] for r in cheap[:4]}
+    score = Counter()
+    for f, rs in used.items():
+        if f == f0:
+            continue
+        for r in rs:
+            score[f] += xs[r] * ((routes[r]["p_dep"] in ports) + (routes[r]["p_arr"] in ports)
+                                 + 0.5 * (routes[r]["carrier"] in ms_))
+    hold = [f for f, v in score.most_common(3 * size) if v > 0]
+    rng.shuffle(hold)
+    return f"bigspot:f{f0}", {f0} | set(hold[: size - 1])
+
+
+def unlock(inst, sol, rng, size):
+    """Targeted unlock of a big SPOT flow f0 (what-if: f54 alone is worth -6..-9M): free f0, the holders of the
+    ports of its cheap real routes ranked by cheapest detour (unit cost of their best route avoiding those ports
+    minus current unit cost) until ~2.5 n_f0 of port volume, and the users of the lightest site of one full carrier
+    that f0's cheap routes need."""
+    routes, flows, carriers = inst["routes"], inst["flows"], inst["carriers"]
+    spot = next(c["id"] for c in carriers if c["name"] == "SPOT")
+    cost = unit_costs(inst)
+    xs = {e["route"]: e["n"] for e in sol["x"]}
+    used = {}
+    for r in xs:
+        used.setdefault(routes[r]["flow"], []).append(r)
+    w = {}
+    for f, rs in used.items():
+        sp = [r for r in rs if routes[r]["carrier"] == spot]
+        real = [cost[r] for r in flows[f]["routes"] if routes[r]["carrier"] != spot]
+        if sp and real:
+            w[f] = sum(xs[r] for r in sp) * max(1, cost[sp[0]] - min(real))
+    if not w:
+        return "unlock", set()
+    top = sorted(w, key=w.get, reverse=True)[:4]
+    f0 = rng.choices(top, weights=[w[f] ** 1.5 for f in top])[0]
+    F0 = flows[f0]
+    cheap = sorted((r for r in F0["routes"] if routes[r]["carrier"] != spot), key=lambda r: cost[r])[: rng.choice([4, 6])]
+    P = {routes[r][k] for r in cheap for k in ("p_dep", "p_arr")}
+    cand = []
+    for f, rs in used.items():
+        if f == f0:
+            continue
+        vp = sum(xs[r] * ((routes[r]["p_dep"] in P) + (routes[r]["p_arr"] in P)) for r in rs)
+        if not vp:
+            continue
+        unit = sum(xs[r] * cost[r] for r in rs) / flows[f]["n"]
+        alt = [cost[r] for r in flows[f]["routes"] if routes[r]["p_dep"] not in P and routes[r]["p_arr"] not in P]
+        det = (min(alt) - unit) if alt else 1e9
+        cand.append((det * rng.uniform(0.8, 1.25), vp, f))
+    cand.sort()
+    free, tot = {f0}, 0
+    site_slots = []
+    S = {}
+    for r in xs:
+        m, fl = routes[r]["carrier"], flows[routes[r]["flow"]]
+        S.setdefault(m, Counter()).update({fl["t_dep"]: xs[r], fl["t_arr"]: xs[r]})
+    need = [routes[r]["carrier"] for r in cheap
+            if len(S.get(routes[r]["carrier"], {})) >= carriers[routes[r]["carrier"]]["sites"]
+            and ({F0["t_dep"], F0["t_arr"]} - set(S[routes[r]["carrier"]]))]
+    tag = f"unlock:f{f0}"
+    if need:
+        m = rng.choice(need)
+        ends = {F0["t_dep"], F0["t_arr"]}
+        light = sorted((v, t) for t, v in S[m].items() if t not in ends)[:3]
+        t_old = rng.choice(light)[1]
+        site_slots = [fl for fl, rs in used.items() if fl != f0 and any(
+            routes[r]["carrier"] == m and t_old in (flows[fl]["t_dep"], flows[fl]["t_arr"]) for r in rs)]
+        tag += f"/{carriers[m]['name'][-1]}-{t_old}"
+    free |= set(site_slots[:12])
+    for det, vp, f in cand:
+        if len(free) >= size:
+            break
+        if f not in free:
+            free.add(f)
+            tot += vp
+    if len(free) < size:  # second ring: holders of the ports the freed flows would detour to
+        P2 = Counter()
+        for f in free:
+            for r in sorted(flows[f]["routes"], key=lambda r: cost[r])[:4]:
+                for k in ("p_dep", "p_arr"):
+                    if routes[r][k] not in P:
+                        P2[routes[r][k]] += 1
+        ring = [f for f, rs in used.items() if f not in free
+                and any(routes[r][k] in P2 for r in rs for k in ("p_dep", "p_arr"))]
+        ring.sort(key=lambda f: -sum(P2[routes[r][k]] for r in used[f] for k in ("p_dep", "p_arr")))
+        free |= set(ring[: size - len(free)])
+    return tag, free
 
 
 def attribution(inst, sol, res):
@@ -347,14 +548,20 @@ def main():
             else:
                 continue
         elif mode == "alns":
-            kinds = ["site", "worst", "carrier", "spot", "regret", "topk", "port"]
+            kinds = KINDS
             wts = [(stats[k + "_won"] + 1) / (stats[k + "_tried"] + 2) for k in kinds]  # adaptive (ALNS)
             if a.kinds:
                 wts = [w if k in a.kinds.split(",") else 0.0 for k, w in zip(kinds, wts)]
             size = min(70, int(a.size * 1.25 ** (fails // 5)))  # grow neighbourhoods while stagnating
             kind, free = neighbourhoods(inst, sol, res, rng, rng.randint(max(5, size - 10), size + 15), wts)
             pc, rl = rng.choice([(2, 6), (2, 8), (3, 10), (3, 12), (None, None)])
-            if rl is None:  # full candidate catalogue: keep the neighbourhood small
+            if kind.startswith(("swap", "open")):
+                pc, rl = rng.choice([(3, None), (2, None)])
+            elif kind.startswith("unlock"):
+                pc, rl = rng.choice([(3, None), (2, None), (2, 14)])
+            elif kind.startswith("bigspot"):
+                pc, rl = rng.choice([(2, None), (2, 12), (3, 16)])
+            elif rl is None:  # full candidate catalogue: keep the neighbourhood small
                 free = set(rng.sample(sorted(free), min(len(free), 14)))
         else:
             lo, hi = map(float, a.destroy.split("-"))
@@ -382,7 +589,7 @@ def main():
                 raw = ms.pack(*ms.unpack(trial[0]))
                 rr = evaluate(inst, raw)
                 if rr["valid"] and rr["score"] == res["score"] and topk_sum(rr) < topk_sum(res):
-                    stats[kind + "_plateau"] += 1
+                    stats[kind.split(":")[0] + "_plateau"] += 1
                     print(f"{datetime.datetime.now():%H:%M:%S} {name} PLATEAU {kind} top8 {topk_sum(res)} -> "
                           f"{topk_sum(rr)}", flush=True)
                     sol, res = raw, rr
@@ -390,10 +597,14 @@ def main():
                 elif rr["valid"] and rr["score"] < res["score"]:
                     cand = raw
             r2 = evaluate(inst, cand)
-            stats[kind + "_tried"] += 1
+            if ":" in kind:  # structural scopes: log every attempt (trial None = no feasible repair in time)
+                print(f"{datetime.datetime.now():%H:%M:%S} {name} try {kind} |free|={len(free)} pc={pc} "
+                      f"trial={'none' if trial is None else evaluate(inst, ms.pack(*ms.unpack(trial[0])))['score']} "
+                      f"inc={res['score']} ({time.monotonic() - t0:.0f}s)", flush=True)
+            stats[kind.split(":")[0] + "_tried"] += 1
             fails += 1
         if r2["valid"] and r2["score"] < res["score"]:
-            stats[kind + "_won"] += 1
+            stats[kind.split(":")[0] + "_won"] += 1
             fails = 0
             print(f"{datetime.datetime.now():%H:%M:%S} {name} {kind:7s} |free|={len(free):2d} pc={pc} rl={rl} "
                   f"{res['score']} -> {r2['score']} ({time.monotonic() - t0:.0f}s)", flush=True)

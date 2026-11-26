@@ -55,7 +55,7 @@ EVT = re.compile(r"^(?:(\d\d:\d\d:\d\d) .*?(?:->|PLATEAU|KICK|XOVER).*|### .*|Mo
 
 def workers():
     rows, events = [], []
-    logs = (glob.glob("runs/claude/warm*.txt") + glob.glob("runs/claude/lns*.txt") + glob.glob("runs/claude/smoke*.txt")
+    logs = (glob.glob("runs/claude/warm*.txt") + glob.glob("runs/claude/warm*.txt.out") + glob.glob("runs/claude/lns*.txt") + glob.glob("runs/claude/smoke*.txt")
             + glob.glob("runs/claude/scratch*.log") + glob.glob("runs/claude/portfolio.log"))
     for p in sorted(logs):
         age = time.time() - os.path.getmtime(p)

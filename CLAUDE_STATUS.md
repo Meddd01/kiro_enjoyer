@@ -92,6 +92,14 @@ Codex `milp_solver._candidate(free=..., per_carrier 2-3, route_limit 6-12, reuse
 | 15:38 | lex portfolio 6 slots (portfolio.py) | 832.31M -> 831.99M in 15 min; alliances slot 43 wins | running until 17:30 |
 | 15:47 | Codex solve() from scratch, strikes, 2 seeds x300s | 480.2M both (far worse basin) | rejected |
 | 15:53 | wide lex workers (rel size 50, strikes 45, sub 60) | running | A/B vs 25-flow slots |
+| 16:24 | what-if simulation (move each big SPOT flow onto a robust pair, relaxed eval) | f54 (3401 TEU, 17->3) alone: -6.3M rel / -9.1M str / -6.1M all; blockers = ports 38/46 manut + carrier sites(m) | root cause of the leaderboard gap |
+| 16:25 | `swap`/`open` scopes (close lightest (m,t), open best-gain (m,t')) | small wins only | dropped |
+| 16:30 | `bigspot` scope (big SPOT flow + random port holders) | small wins | dropped |
+| 16:35 | **`unlock` scope** (big SPOT flow + port holders ranked by cheapest detour + lightest site of a needed full carrier, pc=3, rl=None, 150 s) | strikes -302k in 2 moves -> pf_5 then 267.55M; alliances -56k | main bet |
+| 16:40 | forced f54 onto F+I (reliability), 47-flow repair 240 s | relaxed 279.9M but no feasible repair found | needs bigger scope: 100-flow unlock (2nd ring), 400 s |
+| 17:55 | diagnosis: site 17 reaches only port 46 (17886) but 25109 TEU touch it; port-46 knapsack already near value-optimal (f54<->f61 swap ~0.9M) | the gap is structural (site sets, pairing, fees), not the hub | - |
+| 18:00 | **`open_carrier.py`** (strikes never used G: 91 flows / 17.9k TEU cheaper on G; free top-45 flows by G gain, exact MILP 600 s) | strikes 266.07M -> 265.87M in 1 round | keep; try A, C, reliability C |
+| 18:05 | **FINAL submitted** | 276,151,962 / 285,352,183 / 265,874,001 = **827,378,146**; zip 10 files, 2327 lines | submitted |
 Team best per instance is always the min over `solutions/**/<name>.json` + `codex_teamwarmup/` (evaluator-checked);
 `runs/claude/relaunch.sh ROUND` snapshots it into `solutions/team_best/` and restarts the workers.
 
