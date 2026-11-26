@@ -50,20 +50,38 @@ def collect(insts):
     return best, alln
 
 
+EVT = re.compile(r"^(?:(\d\d:\d\d:\d\d) .*?(?:->|PLATEAU|KICK|XOVER).*|### .*|Model-checked.*|.*reseed.*|.*move slot.*|.*final \d+.*)$", re.M)
+
+
 def workers():
-    rows = []
-    for p in sorted(glob.glob("runs/claude/warm*.txt") + glob.glob("runs/claude/lns*.txt") + glob.glob("runs/claude/smoke*.txt")):
+    rows, events = [], []
+    logs = (glob.glob("runs/claude/warm*.txt") + glob.glob("runs/claude/lns*.txt") + glob.glob("runs/claude/smoke*.txt")
+            + glob.glob("runs/claude/scratch*.log") + glob.glob("runs/claude/portfolio.log"))
+    for p in sorted(logs):
         age = time.time() - os.path.getmtime(p)
-        if age > 1800 and "warm" not in p:
+        if age > 1800 and "pf_" not in p:
             continue
         txt = open(p, encoding="utf-8", errors="replace").read()
+        if "pf_" in p:  # portfolio slots append restarts: only the current run counts
+            txt = txt[txt.rfind("### "):] if "### " in txt else txt
+        name = os.path.basename(p).rsplit(".", 1)[0]
         wins = re.findall(r"^(\d\d:\d\d:\d\d) \S+ (\S+)\s.*?(\d+) -> (\d+)", txt, re.M)
-        state = "error" if "Traceback" in txt else ("finished" if re.search(r"final \d+", txt)
-                                                     else ("running" if age < 120 else "idle"))
-        rows.append({"name": os.path.basename(p)[:-4], "state": state, "wins": len(wins),
+        scores = re.findall(r"-> (\d+)|Model-checked score (\d+)|objective (\d+)\.", txt)
+        cur = next((int(x or y or z) for x, y, z in reversed(scores)), None)
+        hdr = re.findall(r"### \S+ START slot \d+ (\S+) (\S+)", txt)
+        state = "error" if "Traceback" in txt else ("finished" if re.search(r"final \d+|Model-checked score|portfolio finished", txt)
+                                                     else ("running" if age < 150 else "idle"))
+        lines = [m.group(0).strip() for m in EVT.finditer(txt)]
+        for ln in lines[-15:]:
+            t = ln[:8] if re.match(r"\d\d:\d\d:\d\d", ln) else ""
+            events.append({"t": t, "src": name, "line": ln[9:] if t else ln})
+        rows.append({"name": name, "state": state, "wins": len(wins), "plateau": txt.count("PLATEAU"),
+                     "kicks": txt.count("KICK"), "inst": hdr[-1][0] if hdr else "", "family": hdr[-1][1] if hdr else "",
+                     "current": cur, "age": int(age),
                      "gain": int(wins[0][2]) - int(wins[-1][3]) if wins else 0,
-                     "last": f"{wins[-1][0]} {wins[-1][1]} -> {int(wins[-1][3]):,}".replace(",", " ") if wins else ""})
-    return rows
+                     "tail": [re.sub(r"\s+", " ", ln)[:140] for ln in lines[-4:]]})
+    events.sort(key=lambda e: e["t"], reverse=True)
+    return rows, events[:40]
 
 
 def fetch_board():
@@ -107,8 +125,13 @@ def _loop():
             json.dump(hist, open(HIST, "w"))
         ranked = [r for r in board["rows"] if r["total"]]
         best_inst = [min((r["inst"][i] for r in ranked if r["inst"][i]), default=None) for i in range(3)]
+        wrows, events = workers()
+        try:
+            pf = json.load(open("runs/claude/portfolio.json"))
+        except (OSError, ValueError):
+            pf = []
         live = {"updated": time.time(), "best": best, "candidates": {n: alln[n][:6] for n in NAMES}, "total": total,
-                "history": hist, "workers": workers(), "board": board, "team": TEAM,
+                "history": hist, "workers": wrows, "events": events, "portfolio": pf, "board": board, "team": TEAM,
                 "board_best_inst": best_inst,
                 "rank_if_submitted": (1 + sum(1 for r in ranked if r["team"] != TEAM and r["total"] < total)) if total and ranked else None}
         tmp = os.path.join(DIR, "live.json.tmp")
@@ -119,7 +142,7 @@ def _loop():
                 break
             except PermissionError:
                 time.sleep(0.25)
-        time.sleep(10)
+        time.sleep(3)
 
 
 PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><title>KIRO live</title><style>
@@ -148,7 +171,10 @@ th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--grid)}th{col
 <h2>Best valid solution per instance <span class="mut" style="font-weight:400">(submit these files)</span></h2>
 <table><thead><tr><th>instance</th><th class=num>score</th><th class=num>vs our board row</th><th class=num>vs best on board</th><th>worst</th><th>file</th></tr></thead><tbody id="inst"></tbody></table>
 <h2>Team best total over time</h2><div id="chart"></div><div id="tip" class="tip" hidden></div>
-<h2>LNS workers</h2><table><thead><tr><th>log</th><th>state</th><th class=num>wins</th><th class=num>gain</th><th>last improvement</th></tr></thead><tbody id="wk"></tbody></table>
+<h2>Live workers <span class="mut" style="font-weight:400">(current score = last value the script reported; refreshes every 3 s)</span></h2>
+<table><thead><tr><th>script</th><th>instance / family</th><th>state</th><th class=num>current score</th><th class=num>wins</th><th class=num>plateau</th><th class=num>gain</th><th class=num>idle</th><th>latest lines</th></tr></thead><tbody id="wk"></tbody></table>
+<h2>Live activity feed <span class="mut" style="font-weight:400">(wins, plateau moves, kicks, restarts, solver results — newest first)</span></h2>
+<table><thead><tr><th>time</th><th>script</th><th>event</th></tr></thead><tbody id="ev"></tbody></table>
 <h2>Leaderboard (public, refreshed every 2 min) <span class="mut" id="bfetch" style="font-weight:400"></span></h2>
 <table><thead><tr><th class=num>#</th><th>team</th><th class=num>total</th><th class=num>alliances</th><th class=num>reliability</th><th class=num>strikes</th><th class=num>sent</th></tr></thead><tbody id="lb"></tbody></table>
 <script>
@@ -176,11 +202,13 @@ document.getElementById('rank').textContent=d.rank_if_submitted?'#'+d.rank_if_su
 if(first){document.getElementById('gap').textContent=M(d.total-first.total);document.getElementById('gapsub').textContent=first.team+' '+f(first.total)}
 document.getElementById('inst').innerHTML=N.map((n,i)=>{const b=d.best[n];if(!b)return`<tr><td>${n}</td><td colspan=5>no valid file</td></tr>`;
 return`<tr><td>${n}</td><td class=num><b>${f(b.score)}</b></td><td class=num>${us?M(b.score-us.inst[i]):'—'}</td><td class=num>${d.board_best_inst[i]?M(b.score-d.board_best_inst[i]):'—'}</td><td>s${b.worst}</td><td class=path>${b.file}</td></tr>`}).join('');
-document.getElementById('wk').innerHTML=d.workers.map(w=>`<tr><td>${w.name}</td><td><span class="st ${w.state}">${w.state}</span></td><td class=num>${w.wins}</td><td class=num>${f(w.gain)}</td><td>${w.last}</td></tr>`).join('');
+const ws=d.workers.slice().sort((a,b)=>(a.state==='running'?0:1)-(b.state==='running'?0:1)||a.name.localeCompare(b.name));
+document.getElementById('wk').innerHTML=ws.map(w=>`<tr><td>${w.name}</td><td>${w.inst?w.inst+' / '+w.family:''}</td><td><span class="st ${w.state}">${w.state}</span></td><td class=num><b>${f(w.current)}</b></td><td class=num>${w.wins}</td><td class=num>${w.plateau}</td><td class=num>${f(w.gain)}</td><td class=num>${w.age}s</td><td class=path>${w.tail.map(t=>t.replace(/</g,'&lt;')).join('<br>')}</td></tr>`).join('');
+document.getElementById('ev').innerHTML=d.events.map(e=>`<tr><td>${e.t}</td><td>${e.src}</td><td class=path>${e.line.replace(/</g,'&lt;')}</td></tr>`).join('');
 document.getElementById('bfetch').textContent=d.board.fetched?'fetched '+tm(d.board.fetched)+(d.board.error?' (last error: '+d.board.error+')':''):'not fetched yet';
 const show=rows.filter((r,i)=>i<12||r.team===d.team);document.getElementById('lb').innerHTML=show.map(r=>`<tr class="${r.team===d.team?'us':''}"><td class=num>${r.rank}</td><td>${r.team}</td><td class=num>${f(r.total)}</td>${r.inst.map(v=>`<td class=num>${f(v)}</td>`).join('')}<td class=num>${r.sent??''}</td></tr>`).join('');
 if(JSON.stringify(d.history)!==JSON.stringify(H)){H=d.history;chart(H,first&&first.total)}}catch(e){document.getElementById('upd').textContent='server not reachable — is dashboard.py running?';document.getElementById('pulse').style.background='var(--bad)'}}
-tick();setInterval(tick,5000);
+tick();setInterval(tick,3000);
 </script></body></html>"""
 
 
